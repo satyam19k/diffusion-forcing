@@ -4,10 +4,12 @@ https://github.com/CompVis/stable-diffusion
 """
 
 import types
-from typing import Tuple, Callable
+from typing import Tuple, Callable, Optional, Dict, Any
 from functools import partial
 from omegaconf import OmegaConf, DictConfig
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import lightning.pytorch as pl
 from einops import rearrange
 from diffusers import AutoencoderKL as DiffuserImageVAE
@@ -24,6 +26,7 @@ from ..common.distribution import DiagonalGaussianDistribution
 from ..common.base_vae import VAE
 from ..common.losses import LPIPSWithDiscriminator, warmup
 from .model import Encoder, Decoder
+from .predictor import LatentPredictor
 
 
 class ImageVAETrainer(pl.LightningModule):
@@ -276,6 +279,339 @@ class ImageVAETrainer(pl.LightningModule):
 
     def get_last_layer(self):
         return self.decoder.conv_out.weight
+
+
+class ImageVAEPredictiveTrainer(ImageVAETrainer):
+    """
+    ImageVAE Trainer with JEPA-style predictive loss.
+    Jointly trains the VAE with a predictor that predicts future latents from current latents + actions.
+    
+    L_total = L_VAE + λ * L_pred
+    where L_pred = MSE(predictor(μ_t, a_t), stopgrad(μ_{t+1}))
+    """
+    
+    def __init__(self, cfg: DictConfig):
+        super().__init__(cfg)
+        
+        # Predictor configuration
+        predictor_cfg = cfg.get("predictor", {})
+        self.predictor_enabled = predictor_cfg.get("enabled", True)
+        self.lambda_pred = predictor_cfg.get("lambda_pred", 1.0)
+        
+        if self.predictor_enabled:
+            # Get latent dimensions from ddconfig
+            latent_size = cfg.ddconfig.resolution // 8  # VAE downsamples by 8x
+            latent_channels = cfg.embed_dim
+            action_dim = cfg.get("action_dim", 4)  # Minecraft has 4 actions
+            hidden_dim = predictor_cfg.get("hidden_dim", 64)
+            
+            self.predictor = LatentPredictor(
+                latent_channels=latent_channels,
+                latent_size=latent_size,
+                action_dim=action_dim,
+                hidden_dim=hidden_dim,
+            )
+        
+        # Load pretrained VAE weights if specified
+        pretrained_vae_path = cfg.get("pretrained_vae_path", None)
+        if pretrained_vae_path is not None:
+            self._load_pretrained_vae(pretrained_vae_path)
+    
+    def _load_pretrained_vae(self, path: str):
+        """Load pretrained VAE weights (encoder, decoder, quant_conv, post_quant_conv, loss/discriminator)."""
+        if is_hf_path(path):
+            path = hf_to_local_path(path)
+        elif is_wandb_run_path(path):
+            path = wandb_to_local_path(path)
+        
+        checkpoint = torch.load(path, map_location="cpu")
+        state_dict = checkpoint.get("state_dict", checkpoint)
+        
+        # Load ALL weights from pretrained checkpoint
+        # Only exclude keys that don't exist in pretrained (predictor is new)
+        exclude_keys = ["predictor"]
+        filtered_state_dict = {
+            k: v for k, v in state_dict.items()
+            if not any(k.startswith(prefix) for prefix in exclude_keys)
+        }
+        
+        # Load with strict=False to allow missing predictor keys
+        missing, unexpected = self.load_state_dict(filtered_state_dict, strict=False)
+        
+        # Categorize what was loaded
+        loaded_components = set()
+        for k in filtered_state_dict.keys():
+            component = k.split('.')[0]
+            if component == 'loss':
+                component = k.split('.')[1] if len(k.split('.')) > 1 else 'loss'
+            loaded_components.add(component)
+        
+        print(f"Loaded pretrained checkpoint from {path}")
+        print(f"  Loaded components: {sorted(loaded_components)}")
+        print(f"  Missing keys (expected for predictor): {[k for k in missing if 'predictor' in k]}")
+        if unexpected:
+            print(f"  Unexpected keys: {unexpected}")
+    
+    def on_after_batch_transfer(
+        self, batch: Dict[str, torch.Tensor], dataloader_idx: int = 0
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Process batch after transfer to device.
+        Handles both video-only batches and video+action batches.
+        """
+        if isinstance(batch, dict):
+            videos = batch["videos"]
+            videos = 2.0 * videos - 1.0  # normalize to [-1, 1]
+            result = {"videos": videos}
+            
+            # Include actions if present (dataset returns "conds")
+            if "conds" in batch:
+                result["actions"] = batch["conds"]
+            
+            return result
+        else:
+            # Fallback for tensor-only batches
+            return 2.0 * batch - 1.0
+    
+    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
+        """
+        Training step with joint VAE + predictive loss.
+        """
+        # pylint: disable=unpacking-non-sequence
+        opt_ae, opt_disc = self.optimizers()
+        
+        videos = batch["videos"]  # (B, T, C, H, W)
+        actions = batch.get("actions", None)  # (B, T, action_dim) or None
+        
+        batch_size, n_frames = videos.shape[:2]
+        
+        # Flatten for VAE processing
+        videos_flat = rearrange(videos, "b t c h w -> (b t) c h w")
+        
+        # Forward pass through VAE
+        reconstructions, posterior = self(videos_flat)
+        
+        log_loss = partial(
+            self.log,
+            prog_bar=True,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+        )
+        
+        log_loss_dict = partial(
+            self.log_dict,
+            prog_bar=False,
+            logger=True,
+            on_step=True,
+            on_epoch=False,
+        )
+        
+        # Warm-up logic (same as parent)
+        should_warmup, lr_scale = False, 1.0
+        if self.global_step < self.warmup_steps:
+            should_warmup = True
+            lr_scale = float(self.global_step + 1) / self.warmup_steps
+        elif (
+            self.global_step >= self.cfg.lossconfig.disc_start - 1
+            and self.global_step < self.cfg.lossconfig.disc_start + self.warmup_steps
+        ):
+            should_warmup = True
+            lr_scale = (
+                float(self.global_step - self.cfg.lossconfig.disc_start + 1)
+                / self.warmup_steps
+            )
+        lr_scale = min(1.0, lr_scale)
+        
+        # Compute VAE loss
+        aeloss, log_dict_ae = self.loss(
+            videos_flat,
+            reconstructions,
+            posterior,
+            0,
+            self.global_step,
+            last_layer=self.get_last_layer(),
+            split="train",
+        )
+        
+        # Compute predictive loss if enabled and actions are available
+        pred_loss = torch.tensor(0.0, device=self.device)
+        if self.predictor_enabled and actions is not None and n_frames > 1:
+            # Get latent means: (B*T, C, H, W) -> (B, T, C, H, W)
+            latent_means = posterior.mean
+            latent_means = rearrange(
+                latent_means, "(b t) c h w -> b t c h w", b=batch_size, t=n_frames
+            )
+            
+            # Current and next latents
+            mu_t = latent_means[:, :-1]  # (B, T-1, C, H, W)
+            mu_t1_target = latent_means[:, 1:].detach()  # (B, T-1, C, H, W) - stopgrad
+            
+            # Current actions
+            a_t = actions[:, :-1]  # (B, T-1, action_dim)
+            
+            # Flatten for predictor
+            mu_t_flat = rearrange(mu_t, "b t c h w -> (b t) c h w")
+            a_t_flat = rearrange(a_t, "b t d -> (b t) d")
+            mu_t1_target_flat = rearrange(mu_t1_target, "b t c h w -> (b t) c h w")
+            
+            # Predict next latent
+            mu_t1_pred = self.predictor(mu_t_flat, a_t_flat)
+            
+            # MSE loss between prediction and target
+            pred_loss = F.mse_loss(mu_t1_pred, mu_t1_target_flat)
+            
+            log_loss("train/pred_loss", pred_loss)
+        
+        # Total autoencoder loss
+        total_aeloss = aeloss + self.lambda_pred * pred_loss
+        
+        # Optimize autoencoder + predictor
+        opt_ae.zero_grad()
+        self.manual_backward(total_aeloss)
+        self.clip_gradients(opt_ae, gradient_clip_val=self.gradient_clip_val)
+        if should_warmup:
+            opt_ae = warmup(opt_ae, self.learning_rate, lr_scale)
+        opt_ae.step()
+        
+        log_loss("aeloss", aeloss)
+        log_loss("total_aeloss", total_aeloss)
+        log_loss_dict(log_dict_ae)
+        
+        # Optimize discriminator (same as parent)
+        discloss, log_dict_disc = self.loss(
+            videos_flat,
+            reconstructions,
+            posterior,
+            1,
+            self.global_step,
+            last_layer=self.get_last_layer(),
+            split="train",
+        )
+        
+        opt_disc.zero_grad()
+        self.manual_backward(discloss)
+        self.clip_gradients(opt_disc, gradient_clip_val=self.gradient_clip_val)
+        if should_warmup:
+            opt_disc = warmup(opt_disc, self.learning_rate, lr_scale)
+        opt_disc.step()
+        
+        log_loss("discloss", discloss)
+        log_loss_dict(log_dict_disc)
+    
+    def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
+        """
+        Validation step with predictive loss logging.
+        """
+        videos = batch["videos"]  # (B, T, C, H, W)
+        actions = batch.get("actions", None)
+        
+        batch_size, n_frames = videos.shape[:2]
+        videos_flat = rearrange(videos, "b t c h w -> (b t) c h w")
+        
+        reconstructions, posterior = self(videos_flat)
+        
+        # VAE losses
+        aeloss, log_dict_ae = self.loss(
+            videos_flat,
+            reconstructions,
+            posterior,
+            0,
+            self.global_step,
+            last_layer=self.get_last_layer(),
+            split="val",
+        )
+        
+        discloss, log_dict_disc = self.loss(
+            videos_flat,
+            reconstructions,
+            posterior,
+            1,
+            self.global_step,
+            last_layer=self.get_last_layer(),
+            split="val",
+        )
+        
+        self.log("val/rec_loss", log_dict_ae["val/rec_loss"], sync_dist=True)
+        self.log_dict(log_dict_ae, sync_dist=True)
+        self.log_dict(log_dict_disc, sync_dist=True)
+        
+        # Predictive loss
+        if self.predictor_enabled and actions is not None and n_frames > 1:
+            latent_means = posterior.mean
+            latent_means = rearrange(
+                latent_means, "(b t) c h w -> b t c h w", b=batch_size, t=n_frames
+            )
+            
+            mu_t = latent_means[:, :-1]
+            mu_t1_target = latent_means[:, 1:].detach()
+            a_t = actions[:, :-1]
+            
+            mu_t_flat = rearrange(mu_t, "b t c h w -> (b t) c h w")
+            a_t_flat = rearrange(a_t, "b t d -> (b t) d")
+            mu_t1_target_flat = rearrange(mu_t1_target, "b t c h w -> (b t) c h w")
+            
+            mu_t1_pred = self.predictor(mu_t_flat, a_t_flat)
+            pred_loss = F.mse_loss(mu_t1_pred, mu_t1_target_flat)
+            
+            self.log("val/pred_loss", pred_loss, sync_dist=True)
+        
+        # Validation metrics
+        validation_metrics = get_validation_metrics_for_videos(
+            *map(
+                lambda x: rearrange(x, "(b t) c h w -> t b c h w", b=batch_size)
+                .contiguous()
+                .detach(),
+                (videos_flat, reconstructions),
+            ),
+            fid_model=self.fid_model,
+        )
+        
+        self.log_dict(
+            {f"val/{k}": v for k, v in validation_metrics.items()},
+            prog_bar=True,
+            sync_dist=True,
+        )
+        
+        if batch_idx == 0:  # log visualizations
+            videos_vis, reconstructions_vis = (
+                self._rearrange_and_unnormalize(x, batch_size).detach().cpu()
+                for x in (videos_flat, reconstructions)
+            )
+            if self.logger is not None:
+                log_video(
+                    reconstructions_vis,
+                    videos_vis,
+                    step=self.global_step,
+                    namespace="reconstruction_vis",
+                    logger=self.logger.experiment,
+                )
+    
+    def configure_optimizers(self):
+        """Configure optimizers including predictor parameters."""
+        lr = self.learning_rate
+        
+        # Autoencoder parameters
+        ae_params = (
+            list(self.encoder.parameters())
+            + list(self.decoder.parameters())
+            + list(self.quant_conv.parameters())
+            + list(self.post_quant_conv.parameters())
+        )
+        
+        # Add predictor parameters if enabled
+        if self.predictor_enabled:
+            ae_params += list(self.predictor.parameters())
+        
+        opt_ae = torch.optim.Adam(
+            ae_params,
+            lr=lr,
+            betas=(0.5, 0.9),
+        )
+        opt_disc = torch.optim.Adam(
+            self.loss.discriminator.parameters(), lr=lr, betas=(0.5, 0.9)
+        )
+        return [opt_ae, opt_disc], []
 
 
 class ImageVAE(VAE):

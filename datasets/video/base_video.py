@@ -92,7 +92,7 @@ class BaseVideoDataset(torch.utils.data.Dataset, ABC):
         dl: torch.utils.data.DataLoader = torch.utils.data.DataLoader(
             _VideoTimestampsDataset(video_paths),
             batch_size=16,
-            num_workers=64,
+            num_workers=4,  # Reduced from 64 to prevent OOM
             collate_fn=_collate_fn,
         )
         video_pts: List[torch.Tensor] = (

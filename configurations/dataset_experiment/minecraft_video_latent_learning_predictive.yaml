@@ -1,0 +1,21 @@
+# @package _global_
+# Config for Predictive VAE training on Minecraft
+
+dataset:
+  latent:
+    enable: False
+  max_frames: 8           # 7 prediction pairs per clip
+  frame_skip: 1           # Consecutive frames (no skipping)
+  context_length: 0
+  external_cond_dim: 4    # Enable actions (4 for Minecraft)
+
+experiment:
+  training:
+    batch_size: 4         # 4 clips × 7 pairs = 28 predictions/step
+    max_steps: 50000
+    data:
+      num_workers: 4
+  validation:
+    batch_size: 4
+    data:
+      num_workers: 4

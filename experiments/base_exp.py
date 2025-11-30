@@ -9,7 +9,8 @@ from abc import ABC
 from typing import Optional, Union, Dict
 import pathlib
 
-import hydra,torch
+import hydra
+import torch
 from lightning.pytorch.strategies.ddp import DDPStrategy
 
 import lightning.pytorch as pl
