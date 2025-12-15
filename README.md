@@ -1,27 +1,7 @@
 <h1 align="center">Diffusion-Forcing-Aware JEPA-VAE for Minecraft Video Generation</h1>
-<p align="center">
-  <p align="center">
-    <a href="https://kiwhan.dev/">Kiwhan Song*<sup>1</sup></a>
-    ·
-    <a href="https://boyuan.space/">Boyuan Chen*<sup>1</sup></a>
-    ·
-    <a href="https://msimchowitz.github.io/">Max Simchowitz<sup>2</sup></a>
-    ·
-    <a href="https://yilundu.github.io/">Yilun Du<sup>3</sup></a>
-    ·
-    <a href="https://groups.csail.mit.edu/locomotion/russt.html">Russ Tedrake<sup>1</sup></a>
-    ·
-    <a href="https://www.vincentsitzmann.com/">Vincent Sitzmann<sup>1</sup></a>
-    <br/>
-    *Equal contribution <sup>1</sup>MIT <sup>2</sup>CMU <sup>3</sup>Harvard
-  </p>
-  <h4 align="center">ICML 2025</h4>
-  <h3 align="center"><a href="https://arxiv.org/abs/2502.06764">Paper</a> | <a href="https://boyuan.space/history-guidance">Website</a> | <a href="https://huggingface.co/spaces/kiwhansong/diffusion-forcing-transformer">HuggingFace Demo</a> | <a href="https://huggingface.co/kiwhansong/DFoT">Pretrained Models</a></h3>
-</p>
 
 This repository extends the [**Diffusion Forcing Transformer (DFoT)**](https://arxiv.org/abs/2502.06764) framework with **Diffusion-Forcing-Aware JEPA-VAE**, a representation learning approach that shapes VAE latents to be action-conditioned and future-predictive while remaining usable for latent video diffusion. Our method integrates a JEPA-style predictive objective applied to VAE latents, trained with teacher forcing to avoid compounding errors, and jointly optimizes diffusion loss, JEPA latent prediction loss, and reconstruction regularization.
 
-![teaser](teaser.png)
 
 ## 🎯 Key Contributions
 
@@ -89,10 +69,6 @@ conda create python=3.10 -n dfot
 conda activate dfot
 pip install -r requirements.txt
 ```
-
-#### 2. Connect to Weights & Biases:
-We use Weights & Biases for logging. [Sign up](https://wandb.ai/login?signup=true) if you don't have an account, and *modify `wandb.entity` in `config.yaml` to your user/organization name*.
-
 ### Joint DFoT + JEPA Training
 
 Train the model with joint diffusion-aware JEPA training. This command jointly optimizes DFoT, JEPA predictor, and VAE encoder:
@@ -160,6 +136,77 @@ python main.py \
 ```
 
 **Note**: Replace `<path_to_your_checkpoint>` with the path to your trained checkpoint.
+
+
+Offline VAE training command 
+
+```bash
+python -m main \
+  +name=predictive_vae_training \
+  algorithm=image_vae_predictive \
+  experiment=video_latent_learning \
+  dataset=minecraft \
+  dataset_experiment=minecraft_video_latent_learning_predictive \
+  dataset.max_frames=8 \
+  dataset.frame_skip=2 \
+  dataset.external_cond_dim=4 \
+  dataset.context_length=0 \
+  dataset.external_cond_stack=true \
+  algorithm.pretrained_vae_path=pretrained:ImageVAE_MCRAFT.ckpt \
+  experiment.training.batch_size=1 \
+  experiment.training.max_steps=50000 \
+  experiment.training.checkpointing.every_n_train_steps=500 \
+  experiment.validation.val_every_n_step=500 \
+  experiment.validation.batch_size=1 \
+  wandb.entity=local \
+  wandb.mode=offline \
+  algorithm.predictor.lambda_pred=1000.0 \
+  experiment.training.lr=1e-6 \
+  +experiment.training.checkpointing.save_top_k=-1
+```
+
+Command to generate latents :- 
+
+```bash
+python -m main \
+  +name=latent_generation \
+  algorithm=image_vae_preprocessor \
+  experiment=video_latent_preprocessing \
+  dataset=minecraft \
+  dataset_experiment=minecraft_video_latent_preprocessing \
+  dataset.latent.suffix={Add suffix} \
+  experiment.validation.dataset_splits=[validation] \
+  algorithm.pretrained_path={Add model path} \
+  wandb.entity=local \
+  wandb.mode=offline
+
+```
+
+Inference command:- 
+```bash
+python main.py \
+  +name=baseline_inference \
+  experiment=video_generation \
+  dataset=minecraft \
+  algorithm=dfot_video \
+  dataset_experiment=minecraft_video_generation \
+  @DiT/B \
+  @diffusion/continuous \
+  wandb.entity=local \
+  wandb.mode=disabled \
+  load=pretrained:DFoT_MCRAFT.ckpt \
+  'experiment.tasks=[validation]' \
+  experiment.validation.batch_size=1 \
+  dataset.num_eval_videos=50 \
+  dataset.max_frames=8 \
+  dataset.context_length=4 \
+  dataset.n_frames=8 \
+  experiment.ema.enable=false \
+  dataset.latent.suffix={Add latent suffix} \
+  'algorithm.vae.pretrained_path={Add model path}' \
+  algorithm.logging.deterministic=1
+```
+
 
 ### Model Weights
 
