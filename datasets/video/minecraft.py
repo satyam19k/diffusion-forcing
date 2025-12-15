@@ -1,8 +1,6 @@
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional
 import io
 import tarfile
-from pathlib import Path
-
 import torch
 import numpy as np
 from omegaconf import DictConfig
@@ -35,81 +33,31 @@ class MinecraftBaseVideoDataset(BaseVideoDataset):
             "aj",
             "ak",
         ]
-
-        # Download each part into self.save_dir / minecraft_marsh_dataset_xx
         for part_suffix in part_suffixes:
             identifier = f"minecraft_marsh_dataset_{part_suffix}"
             file_name = f"minecraft.tar.part{part_suffix}"
             download(identifier, file_name, destdir=self.save_dir, verbose=True)
 
-        # Concatenate parts into one tar file on disk (no giant BytesIO in RAM)
-        archive_path = self.save_dir / "minecraft.tar"
-        with archive_path.open("wb") as combined:
-            for part_suffix in part_suffixes:
-                identifier = f"minecraft_marsh_dataset_{part_suffix}"
-                file_name = f"minecraft.tar.part{part_suffix}"
-                part_file = self.save_dir / identifier / file_name
-                with part_file.open("rb") as f:
-                    while True:
-                        chunk = f.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        combined.write(chunk)
-
-        # Extract
-        with tarfile.open(archive_path, mode="r") as combined_archive:
-            combined_archive.extractall(self.save_dir)
-
-        # Move into training/validation
-        minecraft_root = self.save_dir / "minecraft"
-        (minecraft_root / "test").rename(self.save_dir / "validation")
-        (minecraft_root / "train").rename(self.save_dir / "training")
-        minecraft_root.rmdir()
-
-        # Delete tar parts + big tar to save space
+        combined_bytes = io.BytesIO()
         for part_suffix in part_suffixes:
             identifier = f"minecraft_marsh_dataset_{part_suffix}"
             file_name = f"minecraft.tar.part{part_suffix}"
-            part_dir = self.save_dir / identifier
-            part_file = part_dir / file_name
-            if part_file.exists():
-                part_file.unlink()
-            if part_dir.exists():
-                part_dir.rmdir()
-        if archive_path.exists():
-            archive_path.unlink()
-
-    # *** NEW: auto-build metadata if missing ***
-    def load_metadata(self) -> List[Dict[str, Any]]:
-        """
-        For Minecraft, metadata is just a list of dicts with a 'video_paths' key
-        pointing to each .mp4 file. If training.pt / validation.pt is missing,
-        we scan the split folder and rebuild it.
-        """
-        metadata_dir = self.save_dir / "metadata"
-        metadata_dir.mkdir(parents=True, exist_ok=True)
-
-        metadata_path = metadata_dir / f"{self.split}.pt"
-
-        # If file exists, just load it
-        if metadata_path.exists():
-            return torch.load(metadata_path, map_location="cpu")
-
-        # Otherwise, rebuild from filesystem
-        split_root = self.save_dir / self.split
-        video_paths = sorted(split_root.glob("*/*.mp4"))  # e.g. training/1_10/000000.mp4
-
-        metadata: List[Dict[str, Any]] = []
-        for vp in video_paths:
-            metadata.append({"video_paths": vp})
-
-        torch.save(metadata, metadata_path)
-        print(f"[MinecraftBaseVideoDataset] Rebuilt metadata for split={self.split} "
-              f"with {len(metadata)} videos at {metadata_path}")
-        return metadata
+            part_file = self.save_dir / identifier / file_name
+            with open(part_file, "rb") as part:
+                combined_bytes.write(part.read())
+        combined_bytes.seek(0)
+        with tarfile.open(fileobj=combined_bytes, mode="r") as combined_archive:
+            combined_archive.extractall(self.save_dir)
+        (self.save_dir / "minecraft/test").rename(self.save_dir / "validation")
+        (self.save_dir / "minecraft/train").rename(self.save_dir / "training")
+        (self.save_dir / "minecraft").rmdir()
+        for part_suffix in part_suffixes:
+            identifier = f"minecraft_marsh_dataset_{part_suffix}"
+            file_name = f"minecraft.tar.part{part_suffix}"
+            part_file = self.save_dir / identifier / file_name
+            part_file.rmdir()
 
     def video_length(self, video_metadata: Dict[str, Any]) -> int:
-        # Each minecraft clip has exactly 300 frames.
         return 300
 
     def build_transform(self):

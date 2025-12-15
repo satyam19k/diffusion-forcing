@@ -2,7 +2,7 @@ from datasets.video import (
     MinecraftAdvancedVideoDataset,
     Kinetics600AdvancedVideoDataset,
 )
-from algorithms.vae import ImageVAETrainer, ImageVAEPredictiveTrainer, VideoVAETrainer
+from algorithms.vae import ImageVAETrainer, ImageVAEPredictiveTrainer, ImageVAEPredictiveRollingTrainer, VideoVAETrainer
 from .base_exp import BaseLightningExperiment
 from .data_modules.utils import _data_module_cls
 
@@ -16,6 +16,7 @@ class VideoLatentLearningExperiment(BaseLightningExperiment):
     compatible_algorithms = dict(
         image_vae=ImageVAETrainer,
         image_vae_predictive=ImageVAEPredictiveTrainer,
+        image_vae_predictive_rolling=ImageVAEPredictiveRollingTrainer,
         video_vae=VideoVAETrainer,
     )
 
@@ -25,3 +26,4 @@ class VideoLatentLearningExperiment(BaseLightningExperiment):
     )
 
     data_module_cls = _data_module_cls
+

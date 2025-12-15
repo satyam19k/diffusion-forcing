@@ -13,9 +13,32 @@ class BaseDataModule(pl.LightningDataModule):
         self.exp_cfg = root_cfg.experiment
         self.compatible_datasets = compatible_datasets
 
+    # def _build_dataset(self, split: str) -> torch.utils.data.Dataset:
+    #     if split in ["training", "test", "validation"]:
+    #         return self.compatible_datasets[self.root_cfg.dataset._name](
+    #             self.root_cfg.dataset, split=split
+    #         )
+    #     else:
+    #         raise NotImplementedError(f"split '{split}' is not implemented")
+
     def _build_dataset(self, split: str) -> torch.utils.data.Dataset:
         if split in ["training", "test", "validation"]:
-            return self.compatible_datasets[self.root_cfg.dataset._name](
+            # Fallback: if _name is not set, try to infer from config
+            if not hasattr(self.root_cfg.dataset, '_name') or self.root_cfg.dataset._name is None:
+                # Try to get from the config file name or other means
+                # For now, raise a clearer error
+                raise ValueError(
+                    "dataset._name is not set! This should be set automatically by Hydra. "
+                    "Make sure you're using 'dataset=minecraft' in your command."
+                )
+            
+            dataset_name = self.root_cfg.dataset._name
+            if dataset_name not in self.compatible_datasets:
+                raise ValueError(
+                    f"Dataset '{dataset_name}' not found. Available: {list(self.compatible_datasets.keys())}"
+                )
+            
+            return self.compatible_datasets[dataset_name](
                 self.root_cfg.dataset, split=split
             )
         else:

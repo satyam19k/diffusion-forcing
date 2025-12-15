@@ -57,7 +57,7 @@ class ImageVAETrainer(pl.LightningModule):
         self.fid_model = None
 
     def init_from_ckpt(self, path, ignore_keys=list()):
-        sd = torch.load(path, map_location="cpu")["state_dict"]
+        sd = torch.load(path, map_location="cpu", weights_only=False)["state_dict"]
         keys = list(sd.keys())
         for k in keys:
             for ik in ignore_keys:
@@ -302,7 +302,14 @@ class ImageVAEPredictiveTrainer(ImageVAETrainer):
             # Get latent dimensions from ddconfig
             latent_size = cfg.ddconfig.resolution // 8  # VAE downsamples by 8x
             latent_channels = cfg.embed_dim
-            action_dim = cfg.get("action_dim", 4)  # Minecraft has 4 actions
+            
+            # Get actual action dimension accounting for frame_skip stacking
+            # Same logic as dataset: external_cond_dim = base_dim * (frame_skip if stacked else 1)
+            base_action_dim = cfg.get("action_dim", 4)
+            frame_skip = cfg.get("frame_skip", 1)
+            external_cond_stack = cfg.get("external_cond_stack", False)
+            action_dim = base_action_dim * (frame_skip if external_cond_stack else 1)
+            
             hidden_dim = predictor_cfg.get("hidden_dim", 64)
             
             self.predictor = LatentPredictor(
@@ -324,7 +331,7 @@ class ImageVAEPredictiveTrainer(ImageVAETrainer):
         elif is_wandb_run_path(path):
             path = wandb_to_local_path(path)
         
-        checkpoint = torch.load(path, map_location="cpu")
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         state_dict = checkpoint.get("state_dict", checkpoint)
         
         # Load ALL weights from pretrained checkpoint
@@ -614,6 +621,379 @@ class ImageVAEPredictiveTrainer(ImageVAETrainer):
         return [opt_ae, opt_disc], []
 
 
+class ImageVAEPredictiveRollingTrainer(ImageVAETrainer):
+    """
+    ImageVAE Trainer with rolling prediction loss (Training Strategy 3).
+    
+    Instead of using ground truth latents at each step, this trainer uses predicted latents
+    from previous steps, allowing errors to accumulate. This encourages latents that are
+    stable and informative over long horizons, ideal for History-Guided DFoT.
+    
+    Procedure:
+    1. Sample a contiguous rollout (O_t, O_{t+1}, ..., O_{t+K})
+    2. Start from encoded z_t = E(O_t) (ground truth)
+    3. For steps j=0..K-1:
+       - Predict z_{t+j+1} = f(z_{t+j}, a_t) where z_{t+j} is PREDICTED (not ground truth)
+       - Use this predicted latent as input to next step
+       - Loss over all steps: Σ_j ||Z_{t+j+1} - Z_pred_{t+j+1}||²
+    
+    L_total = L_VAE + λ * L_pred_rolling
+    where L_pred_rolling = Σ_j MSE(predictor(z_pred_{t+j}, a_t), stopgrad(z_{t+j+1}))
+    """
+    
+    def __init__(self, cfg: DictConfig):
+        super().__init__(cfg)
+        
+        # Predictor configuration
+        predictor_cfg = cfg.get("predictor", {})
+        self.predictor_enabled = predictor_cfg.get("enabled", True)
+        self.lambda_pred = predictor_cfg.get("lambda_pred", 1.0)
+        
+        if self.predictor_enabled:
+            # Get latent dimensions from ddconfig
+            latent_size = cfg.ddconfig.resolution // 8  # VAE downsamples by 8x
+            latent_channels = cfg.embed_dim
+            
+            # Get actual action dimension accounting for frame_skip stacking
+            # Same logic as dataset: external_cond_dim = base_dim * (frame_skip if stacked else 1)
+            base_action_dim = cfg.get("action_dim", 4)
+            frame_skip = cfg.get("frame_skip", 1)
+            external_cond_stack = cfg.get("external_cond_stack", False)
+            action_dim = base_action_dim * (frame_skip if external_cond_stack else 1)
+            
+            hidden_dim = predictor_cfg.get("hidden_dim", 64)
+            
+            self.predictor = LatentPredictor(
+                latent_channels=latent_channels,
+                latent_size=latent_size,
+                action_dim=action_dim,
+                hidden_dim=hidden_dim,
+            )
+        
+        # Load pretrained VAE weights if specified
+        pretrained_vae_path = cfg.get("pretrained_vae_path", None)
+        if pretrained_vae_path is not None:
+            self._load_pretrained_vae(pretrained_vae_path)
+    
+    def _load_pretrained_vae(self, path: str):
+        """Load pretrained VAE weights (encoder, decoder, quant_conv, post_quant_conv, loss/discriminator)."""
+        if is_hf_path(path):
+            path = hf_to_local_path(path)
+        elif is_wandb_run_path(path):
+            path = wandb_to_local_path(path)
+        
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        state_dict = checkpoint.get("state_dict", checkpoint)
+        
+        # Load ALL weights from pretrained checkpoint
+        # Only exclude keys that don't exist in pretrained (predictor is new)
+        exclude_keys = ["predictor"]
+        filtered_state_dict = {
+            k: v for k, v in state_dict.items()
+            if not any(k.startswith(prefix) for prefix in exclude_keys)
+        }
+        
+        # Load with strict=False to allow missing predictor keys
+        missing, unexpected = self.load_state_dict(filtered_state_dict, strict=False)
+        
+        # Categorize what was loaded
+        loaded_components = set()
+        for k in filtered_state_dict.keys():
+            component = k.split('.')[0]
+            if component == 'loss':
+                component = k.split('.')[1] if len(k.split('.')) > 1 else 'loss'
+            loaded_components.add(component)
+        
+        print(f"Loaded pretrained checkpoint from {path}")
+        print(f"  Loaded components: {sorted(loaded_components)}")
+        print(f"  Missing keys (expected for predictor): {[k for k in missing if 'predictor' in k]}")
+        if unexpected:
+            print(f"  Unexpected keys: {unexpected}")
+    
+    def on_after_batch_transfer(
+        self, batch: Dict[str, torch.Tensor], dataloader_idx: int = 0
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Process batch after transfer to device.
+        Handles both video-only batches and video+action batches.
+        """
+        if isinstance(batch, dict):
+            videos = batch["videos"]
+            videos = 2.0 * videos - 1.0  # normalize to [-1, 1]
+            result = {"videos": videos}
+            
+            # Include actions if present (dataset returns "conds")
+            if "conds" in batch:
+                result["actions"] = batch["conds"]
+            
+            return result
+        else:
+            # Fallback for tensor-only batches
+            return 2.0 * batch - 1.0
+    
+    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
+        """
+        Training step with rolling prediction loss.
+        Uses predicted latents from previous steps instead of ground truth.
+        """
+        # pylint: disable=unpacking-non-sequence
+        opt_ae, opt_disc = self.optimizers()
+        
+        videos = batch["videos"]  # (B, T, C, H, W)
+        actions = batch.get("actions", None)  # (B, T, action_dim) or None
+        
+        batch_size, n_frames = videos.shape[:2]
+        
+        # Flatten for VAE processing
+        videos_flat = rearrange(videos, "b t c h w -> (b t) c h w")
+        
+        # Forward pass through VAE
+        reconstructions, posterior = self(videos_flat)
+        
+        log_loss = partial(
+            self.log,
+            prog_bar=True,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+        )
+        
+        log_loss_dict = partial(
+            self.log_dict,
+            prog_bar=False,
+            logger=True,
+            on_step=True,
+            on_epoch=False,
+        )
+        
+        # Warm-up logic (same as parent)
+        should_warmup, lr_scale = False, 1.0
+        if self.global_step < self.warmup_steps:
+            should_warmup = True
+            lr_scale = float(self.global_step + 1) / self.warmup_steps
+        elif (
+            self.global_step >= self.cfg.lossconfig.disc_start - 1
+            and self.global_step < self.cfg.lossconfig.disc_start + self.warmup_steps
+        ):
+            should_warmup = True
+            lr_scale = (
+                float(self.global_step - self.cfg.lossconfig.disc_start + 1)
+                / self.warmup_steps
+            )
+        lr_scale = min(1.0, lr_scale)
+        
+        # Compute VAE loss
+        aeloss, log_dict_ae = self.loss(
+            videos_flat,
+            reconstructions,
+            posterior,
+            0,
+            self.global_step,
+            last_layer=self.get_last_layer(),
+            split="train",
+        )
+        
+        # Compute rolling predictive loss if enabled and actions are available
+        pred_loss = torch.tensor(0.0, device=self.device)
+        if self.predictor_enabled and actions is not None and n_frames > 1:
+            # Get latent means: (B*T, C, H, W) -> (B, T, C, H, W)
+            latent_means = posterior.mean
+            latent_means = rearrange(
+                latent_means, "(b t) c h w -> b t c h w", b=batch_size, t=n_frames
+            )
+            
+            # Ground truth latents for all timesteps (detached for stopgrad)
+            mu_targets = latent_means.detach()  # (B, T, C, H, W)
+            
+            # Actions for all timesteps
+            a_all = actions  # (B, T, action_dim)
+            
+            # Start from ground truth encoded latent z_t = E(O_t)
+            z_pred = latent_means[:, 0]  # (B, C, H, W) - start with ground truth
+            
+            # Accumulate losses over all prediction steps
+            pred_losses = []
+            for j in range(n_frames - 1):
+                # Current predicted latent and action
+                z_pred_flat = z_pred  # (B, C, H, W)
+                a_t = a_all[:, j]  # (B, action_dim)
+                
+                # Predict next latent: z_{t+j+1} = f(z_{t+j}, a_t)
+                z_pred_next = self.predictor(z_pred_flat, a_t)  # (B, C, H, W)
+                
+                # Ground truth target for this step
+                z_target = mu_targets[:, j + 1]  # (B, C, H, W)
+                
+                # Compute loss for this step
+                step_loss = F.mse_loss(z_pred_next, z_target)
+                pred_losses.append(step_loss)
+                
+                # Use predicted latent for next iteration (rolling prediction)
+                z_pred = z_pred_next
+            
+            # Sum losses over all steps: Σ_j ||Z_{t+j+1} - Z_pred_{t+j+1}||²
+            pred_loss = sum(pred_losses)
+            
+            log_loss("train/pred_loss", pred_loss)
+            log_loss("train/pred_loss_mean_per_step", pred_loss / max(1, n_frames - 1))
+        
+        # Total autoencoder loss
+        total_aeloss = aeloss + self.lambda_pred * pred_loss
+        
+        # Optimize autoencoder + predictor
+        opt_ae.zero_grad()
+        self.manual_backward(total_aeloss)
+        self.clip_gradients(opt_ae, gradient_clip_val=self.gradient_clip_val)
+        if should_warmup:
+            opt_ae = warmup(opt_ae, self.learning_rate, lr_scale)
+        opt_ae.step()
+        
+        log_loss("aeloss", aeloss)
+        log_loss("total_aeloss", total_aeloss)
+        log_loss_dict(log_dict_ae)
+        
+        # Optimize discriminator (same as parent)
+        discloss, log_dict_disc = self.loss(
+            videos_flat,
+            reconstructions,
+            posterior,
+            1,
+            self.global_step,
+            last_layer=self.get_last_layer(),
+            split="train",
+        )
+        
+        opt_disc.zero_grad()
+        self.manual_backward(discloss)
+        self.clip_gradients(opt_disc, gradient_clip_val=self.gradient_clip_val)
+        if should_warmup:
+            opt_disc = warmup(opt_disc, self.learning_rate, lr_scale)
+        opt_disc.step()
+        
+        log_loss("discloss", discloss)
+        log_loss_dict(log_dict_disc)
+    
+    def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
+        """
+        Validation step with rolling predictive loss logging.
+        """
+        videos = batch["videos"]  # (B, T, C, H, W)
+        actions = batch.get("actions", None)
+        
+        batch_size, n_frames = videos.shape[:2]
+        videos_flat = rearrange(videos, "b t c h w -> (b t) c h w")
+        
+        reconstructions, posterior = self(videos_flat)
+        
+        # VAE losses
+        aeloss, log_dict_ae = self.loss(
+            videos_flat,
+            reconstructions,
+            posterior,
+            0,
+            self.global_step,
+            last_layer=self.get_last_layer(),
+            split="val",
+        )
+        
+        discloss, log_dict_disc = self.loss(
+            videos_flat,
+            reconstructions,
+            posterior,
+            1,
+            self.global_step,
+            last_layer=self.get_last_layer(),
+            split="val",
+        )
+        
+        self.log("val/rec_loss", log_dict_ae["val/rec_loss"], sync_dist=True)
+        self.log_dict(log_dict_ae, sync_dist=True)
+        self.log_dict(log_dict_disc, sync_dist=True)
+        
+        # Rolling predictive loss
+        if self.predictor_enabled and actions is not None and n_frames > 1:
+            latent_means = posterior.mean
+            latent_means = rearrange(
+                latent_means, "(b t) c h w -> b t c h w", b=batch_size, t=n_frames
+            )
+            
+            mu_targets = latent_means.detach()
+            a_all = actions
+            
+            z_pred = latent_means[:, 0]
+            pred_losses = []
+            
+            for j in range(n_frames - 1):
+                z_pred_flat = z_pred
+                a_t = a_all[:, j]
+                z_pred_next = self.predictor(z_pred_flat, a_t)
+                z_target = mu_targets[:, j + 1]
+                step_loss = F.mse_loss(z_pred_next, z_target)
+                pred_losses.append(step_loss)
+                z_pred = z_pred_next
+            
+            pred_loss = sum(pred_losses)
+            self.log("val/pred_loss", pred_loss, sync_dist=True)
+            self.log("val/pred_loss_mean_per_step", pred_loss / max(1, n_frames - 1), sync_dist=True)
+        
+        # Validation metrics
+        validation_metrics = get_validation_metrics_for_videos(
+            *map(
+                lambda x: rearrange(x, "(b t) c h w -> t b c h w", b=batch_size)
+                .contiguous()
+                .detach(),
+                (videos_flat, reconstructions),
+            ),
+            fid_model=self.fid_model,
+        )
+        
+        self.log_dict(
+            {f"val/{k}": v for k, v in validation_metrics.items()},
+            prog_bar=True,
+            sync_dist=True,
+        )
+        
+        if batch_idx == 0:  # log visualizations
+            videos_vis, reconstructions_vis = (
+                self._rearrange_and_unnormalize(x, batch_size).detach().cpu()
+                for x in (videos_flat, reconstructions)
+            )
+            if self.logger is not None:
+                log_video(
+                    reconstructions_vis,
+                    videos_vis,
+                    step=self.global_step,
+                    namespace="reconstruction_vis",
+                    logger=self.logger.experiment,
+                )
+    
+    def configure_optimizers(self):
+        """Configure optimizers including predictor parameters."""
+        lr = self.learning_rate
+        
+        # Autoencoder parameters
+        ae_params = (
+            list(self.encoder.parameters())
+            + list(self.decoder.parameters())
+            + list(self.quant_conv.parameters())
+            + list(self.post_quant_conv.parameters())
+        )
+        
+        # Add predictor parameters if enabled
+        if self.predictor_enabled:
+            ae_params += list(self.predictor.parameters())
+        
+        opt_ae = torch.optim.Adam(
+            ae_params,
+            lr=lr,
+            betas=(0.5, 0.9),
+        )
+        opt_disc = torch.optim.Adam(
+            self.loss.discriminator.parameters(), lr=lr, betas=(0.5, 0.9)
+        )
+        return [opt_ae, opt_disc], []
+
+
 class ImageVAE(VAE):
     """
     Pretrained ImageVAE model that can be used to encode and decode images.
@@ -645,7 +1025,7 @@ class ImageVAE(VAE):
             path = wandb_to_local_path(path)
         elif is_hf_path(path):
             path = hf_to_local_path(path)
-        checkpoint = torch.load(path, map_location="cpu")
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         # FIXME: temporary fix for vaes trained with older versions of the code (for minecraft VAE)
         if "cfg" not in checkpoint:
             checkpoint["cfg"] = OmegaConf.load(
@@ -657,7 +1037,7 @@ class ImageVAE(VAE):
         # filter out checkpoint state_dict
         state_dict = checkpoint["state_dict"]
         for k in list(state_dict.keys()):
-            if k.startswith("loss"):
+            if k.startswith("loss") or k.startswith("predictor"):
                 del state_dict[k]
         model.load_state_dict(state_dict)
         return model
@@ -712,3 +1092,4 @@ def diffuser_to_custom(vae: DiffuserImageVAE) -> VAE:
     vae.forward = types.MethodType(wrapped_forward, vae)
 
     return vae
+

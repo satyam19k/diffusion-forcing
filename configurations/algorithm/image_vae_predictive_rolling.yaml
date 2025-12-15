@@ -1,5 +1,5 @@
 defaults:
-  - base_pytorch_algo
+ - base_pytorch_algo
 
 # warmup_steps and disc_start will be halved due to GAN training
 # Since we load pretrained weights (including discriminator), disc_start can be low
@@ -32,12 +32,15 @@ action_dim: ${dataset.external_cond_dim}
 frame_skip: ${dataset.frame_skip}
 external_cond_stack: ${dataset.external_cond_stack}
 
-# Predictor configuration
+# Predictor configuration for rolling prediction
+# This uses predicted latents from previous steps instead of ground truth,
+# allowing errors to accumulate and encouraging stable latents over long horizons
 predictor:
   enabled: true
   hidden_dim: 64
-  lambda_pred: 1.0  # weight for predictive loss
+  lambda_pred: 1.0  # weight for rolling predictive loss
 
 # Pretrained VAE path (for loading encoder/decoder weights)
 pretrained_vae_path: "pretrained:ImageVAE_MCRAFT.ckpt"
+
 

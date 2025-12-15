@@ -92,7 +92,7 @@ class BaseVideoDataset(torch.utils.data.Dataset, ABC):
         dl: torch.utils.data.DataLoader = torch.utils.data.DataLoader(
             _VideoTimestampsDataset(video_paths),
             batch_size=16,
-            num_workers=4,  # Reduced from 64 to prevent OOM
+            num_workers=64,
             collate_fn=_collate_fn,
         )
         video_pts: List[torch.Tensor] = (
@@ -210,12 +210,26 @@ class BaseVideoDataset(torch.utils.data.Dataset, ABC):
         return VideoTransform((self.resolution, self.resolution))
 
     def video_metadata_to_latent_path(self, video_metadata: Dict[str, Any]) -> Path:
-        """
-        Convert video_path to latent_path
-        """
-        return (
-            self.latent_dir / video_metadata["video_paths"].relative_to(self.save_dir)
-        ).with_suffix(".pt")
+         """
+         Convert video_path to latent_path
+         """
+         return (
+             self.latent_dir / video_metadata["video_paths"].relative_to(self.save_dir)
+         ).with_suffix(".pt")
+    #def video_metadata_to_latent_path(self, video_metadata: Dict[str, Any]) -> Path:
+     #   video_path = Path(video_metadata["video_paths"])
+     #   save_dir = self.save_dir.resolve()  # Make save_dir absolute
+        
+     #   # Normalize video_path to absolute if needed
+     #   if not video_path.is_absolute():
+     #       video_path = (save_dir / video_path).resolve()
+     #   else:
+     #       video_path = video_path.resolve()
+        
+     #   # Now both are absolute, compute relative path
+     #  return (
+     #       self.latent_dir / video_path.relative_to(save_dir)
+     #   ).with_suffix(".pt")
 
     def get_latent_paths(self, split: SPLIT) -> List[Path]:
         """

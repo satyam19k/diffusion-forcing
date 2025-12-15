@@ -144,9 +144,9 @@ def get_validation_metrics_for_videos(
     batch, frame, channel, height, width = observation_hat.shape
     output_dict = {}
     # some metrics don't fully support fp16
-    if observation_hat.dtype in (torch.float16, torch.bfloat16):
+    if observation_hat.dtype == torch.float16:
         observation_hat = observation_hat.to(torch.float32)
-    if observation_gt.dtype in (torch.float16, torch.bfloat16):
+    if observation_gt.dtype == torch.float16:
         observation_gt = observation_gt.to(torch.float32)
 
     # reshape to (batch * frame, channel, height, width) for image losses
