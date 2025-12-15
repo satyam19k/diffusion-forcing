@@ -6,6 +6,9 @@
 # useful for dataset-specific overrides
 
 dataset:
+  latent:
+    enable: True
+    type: online
   subdataset_size: 2400000
   num_eval_videos: 768
   maximize_training_data: true
