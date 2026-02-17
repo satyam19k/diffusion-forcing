@@ -8,6 +8,7 @@
 dataset:
   latent:
     enable: True
+    type: online  # VAE processing is done online for video generation
   subdataset_size: 1920000
   num_eval_videos: 768
 

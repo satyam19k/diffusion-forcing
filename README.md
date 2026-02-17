@@ -80,27 +80,69 @@ python main.py \
   dataset=minecraft \
   algorithm=dfot_video_jepa \
   dataset_experiment=minecraft_video_generation_jepa \
-  wandb.entity=local \
-  wandb.mode=disabled \
+  wandb.entity=sk12075-new-york-university \
+  wandb.project=dfot \
+  wandb.mode=online \
   dataset.max_frames=8 \
   dataset.context_length=4 \
   load=pretrained:DFoT_MCRAFT.ckpt \
   algorithm.checkpoint.strict=false \
+  algorithm.checkpoint.reset_optimizer=true \
   @DiT/B \
   @diffusion/continuous \
   experiment.training.batch_size=1 \
   experiment.validation.batch_size=1 \
   algorithm.vae.batch_size=1 \
   experiment.training.max_epochs=15 \
-  experiment.training.checkpointing.every_n_train_steps=1000 \
+  experiment.training.checkpointing.every_n_train_steps=100 \
   experiment.training.checkpointing.every_n_epochs=null \
   dataset.subdataset_size=null \
   experiment.validation.limit_batch=0 \
   algorithm.jepa.loss_weight=0 \
   algorithm.jepa.recon_loss_weight=0.5 \
   experiment.find_unused_parameters=true \
+  +experiment.training.checkpointing.save_top_k=-1 \
   algorithm.jepa.training_mode=teacher_forcing
 ```
+
+```bash
+python main.py \
+  +name=jepa_minecraft_tf \
+  experiment=video_generation \
+  dataset=minecraft \
+  algorithm=dfot_video_jepa \
+  dataset_experiment=minecraft_video_generation_jepa \
+  wandb.entity=sk12075-new-york-university \
+  wandb.project=debug \
+  wandb.mode=online \
+  dataset.max_frames=16 \
+  dataset.context_length=8 \
+  load=pretrained:DFoT_MCRAFT.ckpt \
+  algorithm.checkpoint.strict=false \
+  algorithm.checkpoint.reset_optimizer=true \
+  @DiT/B \
+  @diffusion/continuous \
+  experiment.training.batch_size=1 \
+  experiment.validation.batch_size=1 \
+  algorithm.vae.batch_size=1 \
+  experiment.training.max_epochs=15 \
+  experiment.training.checkpointing.every_n_train_steps=2000 \
+  experiment.training.checkpointing.every_n_epochs=null \
+  dataset.subdataset_size=null \
+  experiment.validation.limit_batch=0 \
+  algorithm.jepa.loss_weight=0.5 \
+  algorithm.jepa.recon_loss_weight=0.1 \
+  experiment.find_unused_parameters=true \
+  +experiment.training.checkpointing.save_top_k=-1 \
+  algorithm.jepa.training_mode=teacher_forcing \
+  experiment.validation.limit_batch=10 \
+  experiment.validation.batch_size=5 \
+  experiment.validation.val_every_n_step=2000 \
+  experiment.validation.val_every_n_epoch=null
+
+
+```
+
 
 **Key Parameters:**
 - `algorithm.jepa.loss_weight`: Weight for JEPA loss (set to 0 to disable JEPA, >0 to enable)
@@ -113,7 +155,7 @@ python main.py \
 Run validation/inference with a trained JEPA model:
 
 ```bash
-python main.py \
+TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 python main.py \
   +name=jepa_inference \
   experiment=video_generation \
   dataset=minecraft \
@@ -123,7 +165,7 @@ python main.py \
   @diffusion/continuous \
   wandb.entity=local \
   wandb.mode=disabled \
-  load=<path_to_your_checkpoint> \
+  load='/scratch/sk12075/diffusion-forcing/outputs/2026-02-09/17-41-45/checkpoints/epoch0-step100.ckpt' \
   algorithm.checkpoint.strict=false \
   'experiment.tasks=[validation]' \
   experiment.validation.batch_size=1 \
@@ -135,6 +177,100 @@ python main.py \
   experiment.ema.enable=false
 ```
 
+TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 python main.py \
+  +name=jepa_inference \
+  experiment=video_generation \
+  dataset=minecraft \
+  algorithm=dfot_video_jepa \
+  dataset_experiment=minecraft_video_generation_jepa \
+  @DiT/B \
+  @diffusion/continuous \
+  wandb.entity=local \
+  wandb.mode=disabled \
+  load='/scratch/sk12075/diffusion-forcing/huggingface/models--kiwhansong--DFoT/snapshots/0959defb4c4fe010f84791d732cc978ad7d49fef/pretrained_models/DFoT_MCRAFT.ckpt' \
+  algorithm.checkpoint.strict=false \
+  'experiment.tasks=[validation]' \
+  experiment.validation.batch_size=8 \
+  dataset.num_eval_videos=100 \
+  dataset.max_frames=32 \
+  dataset.context_length=16 \
+  dataset.n_frames=64 \
+  experiment.find_unused_parameters=true \
+  experiment.ema.enable=false
+
+TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 python main.py \
+  +name=jepa_inference \
+  experiment=video_generation \
+  dataset=minecraft \
+  algorithm=dfot_video_jepa \
+  dataset_experiment=minecraft_video_generation_jepa \
+  @DiT/B \
+  @diffusion/continuous \
+  wandb.entity=local \
+  wandb.mode=disabled \
+  load='/scratch/sk12075/diffusion-forcing/huggingface/models--kiwhansong--DFoT/snapshots/0959defb4c4fe010f84791d732cc978ad7d49fef/pretrained_models/DFoT_MCRAFT.ckpt' \
+  algorithm.checkpoint.strict=false \
+  'experiment.tasks=[validation]' \
+  experiment.validation.batch_size=8 \
+  dataset.num_eval_videos=50 \
+  dataset.max_frames=16 \
+  dataset.context_length=8 \
+  dataset.n_frames=16 \
+  experiment.find_unused_parameters=true \
+  experiment.ema.enable=false
+
+TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 python -m main \
+  @DiT/B \
+  @diffusion/continuous \
+  +name=jepa_minecraft_tf_training \
+  experiment=video_generation \
+  dataset=minecraft \
+  algorithm=dfot_video_jepa \
+  dataset_experiment=minecraft_video_generation_jepa \
+  wandb.entity=local \
+  wandb.mode=disabled \
+  load='/scratch/sk12075/diffusion-forcing/huggingface/models--kiwhansong--DFoT/snapshots/0959defb4c4fe010f84791d732cc978ad7d49fef/pretrained_models/DFoT_MCRAFT.ckpt' \
+  algorithm.checkpoint.strict=false \
+  "experiment.tasks=[validation]" \
+  experiment.validation.batch_size=1 \
+  dataset.num_eval_videos=100 \
+  dataset.max_frames=16 \
+  dataset.context_length=8 \
+  dataset.n_frames=16 \
+  experiment.find_unused_parameters=true \
+  experiment.ema.enable=false
+
+TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 python -m main \
+  @DiT/B \
+  @diffusion/continuous \
+  +name=jepa_minecraft_tf_training \
+  experiment=video_generation \
+  dataset=minecraft \
+  algorithm=dfot_video_jepa \
+  dataset_experiment=minecraft_video_generation_jepa \
+  wandb.entity=local \
+  wandb.mode=disabled \
+  load='/scratch/sk12075/diffusion-forcing/outputs/2026-02-12/01-20-07/checkpoints/epoch0-step8000.ckpt' \
+  algorithm.checkpoint.strict=false \
+  "experiment.tasks=[validation]" \
+  experiment.validation.batch_size=1 \
+  dataset.num_eval_videos=100 \
+  dataset.max_frames=16 \
+  dataset.context_length=8 \
+  dataset.n_frames=16 \
+  experiment.find_unused_parameters=true \
+  experiment.ema.enable=false
+
+/scratch/sk12075/diffusion-forcing/outputs/2026-02-12/00-15-02/checkpoints/epoch0-step300.ckpt
+/scratch/sk12075/diffusion-forcing/outputs/2026-02-09/21-33-13/checkpoints/epoch0-step700.ckpt
+
+python main.py   +name=jepa_inference   experiment=video_generation   dataset=minecraft   algorithm=dfot_video_jepa   dataset_experiment=minecraft_video_generation_jepa   @DiT/B   @diffusion/continuous   wandb.entity=local   wandb.mode=disabled   load=/scratch/yb2510/RL_Jayesh/diffusion-forcing-jepa/outputs/2025-12-13/02-05-07/checkpoints/epoch_10_step_251000_v2.ckpt   algorithm.checkpoint.strict=false   'experiment.tasks=[validation]'   experiment.validation.batch_size=1   dataset.num_eval_videos=20   dataset.max_frames=8   dataset.context_length=4   dataset.n_frames=8   experiment.find_unused_parameters=true   experiment.ema.enable=false
+
+1python -m main +name=DFoT dataset=minecraft algorithm=dfot_video experiment=video_generation @diffusion/continuous @DiT/B load='/scratch/sk12075/diffusion-forcing/huggingface/models--kiwhansong--DFoT/snapshots/0959defb4c4fe010f84791d732cc978ad7d49fef/pretrained_models/DFoT_MCRAFT.ckpt' 'experiment.tasks=[validation]' 'algorithm.logging.metrics=[fvd]' dataset.n_frames=150 experiment.validation.batch_size=1 dataset.filter_min_len=0 wandb.entity=sk12075-new-york-university wandb.project=inference wandb.mode=online
+
+wandb.entity=sk12075-new-york-university \
+  wandb.project=dfot \
+  wandb.mode=online \
 **Note**: Replace `<path_to_your_checkpoint>` with the path to your trained checkpoint.
 
 

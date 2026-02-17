@@ -11,7 +11,7 @@ debug: false # global debug flag will be passed into configuration of experiment
 wandb:
   entity: local # placeholder so training does not error even when disabled
   project: dfot # wandb project name; if not provided, defaults to root folder name [fixme]
-  mode: disabled # disable wandb entirely
+  mode: online # disable wandb entirely
 
 resume: null # wandb run id to resume logging and loading checkpoint from
 load: null # wanmdb run id containing checkpoint or a path to a checkpoint file 

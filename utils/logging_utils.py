@@ -71,7 +71,7 @@ def log_video(
         raw_dir.mkdir(parents=True, exist_ok=True)
         observation_gt_np, observation_hat_np = map(
             lambda x: (
-                np.clip(x.detach().cpu().numpy(), a_min=0.0, a_max=1.0) * 255
+                np.clip(x.detach().cpu().float().numpy(), a_min=0.0, a_max=1.0) * 255
             ).astype(np.uint8),
             (observation_gt, observation_hats[0]),
         )
@@ -101,7 +101,7 @@ def log_video(
             observation_hat[:, context_frames, i, :, indices] = c
         observation_gt[:, :, i, [0, -1], :] = c
         observation_gt[:, :, i, :, [0, -1]] = c
-    video = torch.cat([*observation_hats, observation_gt], -1).detach().cpu().numpy()
+    video = torch.cat([*observation_hats, observation_gt], -1).detach().cpu().float().numpy()
 
     # reshape to original shape
     if n_frames is not None:
@@ -115,17 +115,26 @@ def log_video(
     # use wandb directly here since pytorch lightning doesn't support logging videos yet
     if isinstance(captions, str):
         captions = [captions] * n_samples
+    log_dict = {"trainer/global_step": step}
     for i in range(n_samples):
-        name = f"{namespace}/{prefix}_{i + indent}" + (
-            f"_{postfix[i]}" if i < len(postfix) else ""
-        )
+        suffix = f"_{postfix[i]}" if i < len(postfix) else ""
+        base_name = f"{prefix}_{i + indent}{suffix}"
         caption = captions[i] if i < len(captions) else None
-        logger.log(
-            {
-                name: wandb.Video(video[i], fps=24, caption=caption),
-                "trainer/global_step": step,
-            }
+
+        # GIF/video under <namespace>/gifs/
+        log_dict[f"{namespace}/gifs/{base_name}"] = wandb.Video(
+            video[i], fps=24, format="gif", caption=caption
         )
+
+        # Individual frames under <namespace>/frames/<base_name>/
+        # video[i] is (T, C, H, W); wandb.Image expects (H, W, C)
+        T = video[i].shape[0]
+        log_dict[f"{namespace}/frames/{base_name}"] = [
+            wandb.Image(np.transpose(video[i][t], (1, 2, 0)), caption=f"t{t}")
+            for t in range(T)
+        ]
+
+    logger.log(log_dict, step=step, commit=False)
 
 
 def get_validation_metrics_for_videos(

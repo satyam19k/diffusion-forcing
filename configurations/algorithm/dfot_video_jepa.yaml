@@ -21,16 +21,28 @@ jepa:
   vae_lr: 1e-5  # for VAE (if trainable)
 
   # Whether to train VAE encoder/decoder
-  train_vae_encoder: true  # Train encoder to learn predictable representations
-  train_vae_decoder: false  # Keep decoder frozen to preserve reconstruction
+  # train_vae_encoder: true  # Train encoder to learn predictable representations
+  # train_vae_decoder: false  # Keep decoder frozen to preserve reconstruction
 
-  # Use mode() instead of sample() for JEPA targets (deterministic, stable)
-  use_mode_for_targets: true
+  # # Use mode() instead of sample() for JEPA targets (deterministic, stable)
+  # use_mode_for_targets: true
   
+  # SigREG — anti-collapse regularization on online encoder embeddings
+  # Pushes latent distribution toward isotropic Gaussian via sliced EP test
+  sigreg_loss_weight: 1.0   # weight relative to JEPA pred loss; 0 to disable
+  sigreg_num_slices: 1024   # random projection directions (512-2048 typical)
+
   # Training mode: "teacher_forcing" or "autoregressive"
   # - teacher_forcing: use ground truth states as input (faster, more stable)
   # - autoregressive: use predicted states as input (harder, more realistic)
   training_mode: teacher_forcing
+
+  # Number of fixed probe videos to encode and log at every validation step
+  num_vis_videos: 3
+
+  # EMA update schedule
+  ema_decay: 0.99
+  ema_update_every: 100  # steps
 
   # Action encoder config
   action_embed_dim: 256
