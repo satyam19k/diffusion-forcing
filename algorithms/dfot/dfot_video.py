@@ -761,7 +761,7 @@ class DFoTVideo(BasePytorchAlgo):
             self.logging.max_num_videos - self.num_logged_videos,
             batch_size,
         )
-        cut_videos = lambda x: x[:num_videos_to_log]
+        cut_videos = lambda x: x[:num_videos_to_log].float()
 
         for task in self.tasks:
             log_video(
@@ -1328,6 +1328,7 @@ class DFoTVideo(BasePytorchAlgo):
         if padding > 0:
             xs_pred = xs_pred[:, :-padding]
             record = record[:, :, :-padding] if return_all else None
+
 
         return xs_pred, record
 

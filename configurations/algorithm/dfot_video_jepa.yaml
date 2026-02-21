@@ -35,10 +35,18 @@ jepa:
   predictor_mlp_ratio: 4.0
   predictor_dropout: 0.1
 
-  # Decoder reconstruction loss (collapse diagnostic)
-  # Set decoder_loss_weight > 0 to enable
-  decoder_loss_weight: 0.0     # overall weight in total_loss
+  # Decoder reconstruction loss & visualization
+  # Set decoder_loss_weight > 0 to enable (always saves vis regardless)
+  decoder_loss_weight: 1.0     # overall weight in total_loss
   decoder_mse_weight: 1.0      # weight on pixel MSE term
   decoder_lpips_weight: 1.0    # weight on LPIPS perceptual term
   decoder_lr: 1e-4             # lr for online_decoder + online_post_quant_conv
-  decoder_vis_every: 2        # log reconstruction frames every N training steps
+  decoder_vis_every: 5000         # log reconstruction frames every N training steps
+  # Reconstruction regularizer: when true, decoder loss gradients flow through
+  # the encoder (acts as anti-collapse regularizer). When false, encoder is
+  # detached and decoder loss is purely diagnostic.
+  recon_regularizer: false
+  # Frames per chunk in the decoder forward pass during training.
+  # Keep small (2-4): DFoT + JEPA activations fill most GPU memory first.
+  # Independent of vae.batch_size so training batch size can stay large.
+  decoder_chunk_size: 2

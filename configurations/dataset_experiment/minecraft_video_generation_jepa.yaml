@@ -77,12 +77,15 @@ algorithm:
     predictor_dim_head: 64
     predictor_mlp_ratio: 4.0
     predictor_dropout: 0.1
-    # Decoder reconstruction loss (collapse diagnostic)
-    decoder_loss_weight: 0.0
+    # Decoder reconstruction loss & visualization
+    decoder_loss_weight: 1.0
     decoder_mse_weight: 1.0
     decoder_lpips_weight: 1.0
     decoder_lr: 1e-4
-    decoder_vis_every: 2      # log reconstruction frames every N training steps
+    decoder_vis_every: 5000      # log reconstruction frames every N training steps
+    recon_regularizer: false  # set true to flow decoder loss through encoder
+    decoder_chunk_size: 2
+    gradient_clip_val: 1.0  # manual grad clipping (Trainer's is disabled)
 
   logging:
     max_num_videos: 32
@@ -92,6 +95,8 @@ experiment:
     lr: 1e-4
     batch_size: 1
     max_epochs: 15
+    optim:
+      gradient_clip_val: 1.0
   validation:
     batch_size: 16
     data:

@@ -2,20 +2,27 @@
 Dual-Encoder JEPA for DFoT (BYOL-Style).
 
 Architecture:
-- **Target encoder** (frozen): Provides stable latents for DFoT diffusion.
-  The data_mean / data_std normalization stays valid.
+- **Target VAE** (EMA-updated): Provides stable latents for DFoT diffusion
+  and prediction targets for JEPA.  Both encoder and decoder are updated
+  via EMA from their online counterparts.
 - **Online encoder** (trainable): A copy of the VAE encoder that receives
   JEPA gradients.  Learns to produce latents that are inherently predictive
   of future states.
+- **Online decoder** (trainable): Adapts to the online encoder; used for
+  collapse diagnostics and EMA-synced into the target VAE decoder.
 - **ViT Predictor**: Operates on *clean* latent states from the online
-  encoder and encoded actions; predicts future clean latent states.
-- **EMA sync**: The online encoder is slowly blended into the target
-  encoder (like BYOL / DINO) so DFoT gradually benefits from improved
+  encoder and encoded actions; predicts future clean latent states
+  produced by the *target* encoder (BYOL asymmetry).
+- **EMA sync**: The online encoder+decoder is slowly blended into the
+  target VAE (like BYOL / DINO) so DFoT gradually benefits from improved
   representations without sudden distribution shifts.
+- **Running stats**: data_mean / data_std are refreshed after each EMA
+  update to track the target encoder's evolving output distribution.
 
 Gradient paths:
-  DFoT loss  -->  diffusion backbone only
-  JEPA loss  -->  online encoder + predictor + action encoder
+  DFoT loss     -->  diffusion backbone only
+  JEPA loss     -->  online encoder + predictor + action encoder
+  Decoder loss  -->  online decoder only (encoder detached)
 """
 
 from copy import deepcopy
@@ -88,16 +95,13 @@ class CausalAttention(nn.Module):
             lambda t: rearrange(t, "b n (h d) -> b h n d", h=self.heads), qkv
         )
 
-        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-        causal_mask = torch.triu(
-            torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1
+        # FlashAttention-2: ~2-4x faster, O(1) memory vs O(T^2)
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            is_causal=True,
+            dropout_p=self.dropout.p if self.training else 0.0,
         )
-        dots = dots.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
 
-        attn = self.attend(dots)
-        attn = self.dropout(attn)
-
-        out = torch.matmul(attn, v)
         out = rearrange(out, "b h n d -> b n (h d)")
         return self.to_out(out)
 
@@ -239,6 +243,13 @@ class DFoTVideoJEPA(DFoTVideo):
         super()._build_model()
         self._build_jepa_model()
 
+        # Running statistics for tracking target encoder output distribution.
+        # Initialized from the pretrained VAE stats, updated after each EMA step.
+        # Use register_buffer so Lightning auto-moves these to the correct device.
+        self.register_buffer("_running_mean", self.data_mean.clone())
+        self.register_buffer("_running_std", self.data_std.clone())
+        self._stats_momentum = 0.01  # EMA momentum for running stats
+
     def _build_jepa_model(self):
         """Build ViT predictor and action encoder."""
         jepa_cfg = self.jepa_cfg
@@ -343,34 +354,51 @@ class DFoTVideoJEPA(DFoTVideo):
         x_flat = rearrange(videos, "b t c h w -> (b t) c h w")
         x_normalized = 2.0 * x_flat - 1.0
 
-        # Online encoder forward
-        h = self.online_encoder(x_normalized)
-        moments = self.online_quant_conv(h)
-        # Split into mean and logvar, take mode (= mean)
-        mean, _ = torch.chunk(moments, 2, dim=1)
-        latents_flat = mean  # mode() of DiagonalGaussian = mean
+        # Chunk to avoid OOM (matches parent's VAE chunking)
+        vae_bs = self.cfg.vae.batch_size
+        total = x_normalized.shape[0]
+        latent_chunks: list = []
+        for start in range(0, total, vae_bs):
+            x_chunk = x_normalized[start : start + vae_bs]
+            h = self.online_encoder(x_chunk)
+            moments = self.online_quant_conv(h)
+            mean, _ = torch.chunk(moments, 2, dim=1)
+            latent_chunks.append(mean)
+        latents_flat = torch.cat(latent_chunks, dim=0)
 
-        return latents_flat.view(B, T, *latents_flat.shape[1:])
+        return latents_flat.reshape(B, T, *latents_flat.shape[1:])
 
-    def _encode_target(self, videos: Tensor) -> Tensor:
+    @torch.no_grad()
+    def _encode_target_both(self, videos: Tensor) -> Tuple[Tensor, Tensor]:
         """
-        Encode raw videos with the frozen target encoder.
-        Uses mode() for deterministic, clean latents.
+        Encode raw videos with the frozen target encoder **once**, returning
+        both sampled latents (for DFoT) and mode latents (for JEPA targets).
+
+        This avoids running the target encoder twice per training step.
 
         Args:
             videos: (B, T, 3, H, W) in [0, 1]
         Returns:
-            latents: (B, T, C, H, W)
+            sampled: (B, T, C, H, W)  -- stochastic, used by DFoT
+            mode:    (B, T, C, H, W)  -- deterministic, used as JEPA targets
         """
         B, T = videos.shape[:2]
         x_flat = rearrange(videos, "b t c h w -> (b t) c h w")
         x_normalized = 2.0 * x_flat - 1.0
 
-        with torch.no_grad():
-            posterior = self.vae.encode(x_normalized)
-            latents_flat = posterior.mode()
+        vae_bs = self.cfg.vae.batch_size
+        total = x_normalized.shape[0]
+        sample_chunks: list = []
+        mode_chunks: list = []
+        for start in range(0, total, vae_bs):
+            x_chunk = x_normalized[start : start + vae_bs]
+            posterior = self.vae.encode(x_chunk)
+            sample_chunks.append(posterior.sample())
+            mode_chunks.append(posterior.mode())
 
-        return latents_flat.view(B, T, *latents_flat.shape[1:])
+        sampled = torch.cat(sample_chunks, dim=0).reshape(B, T, -1, *sample_chunks[0].shape[2:])
+        mode = torch.cat(mode_chunks, dim=0).reshape(B, T, -1, *mode_chunks[0].shape[2:])
+        return sampled, mode
 
     def _decode_online(self, z: Tensor) -> Tensor:
         """
@@ -388,14 +416,17 @@ class DFoTVideoJEPA(DFoTVideo):
         self, videos: Tensor
     ) -> Tuple[Tensor, Dict[str, Tensor]]:
         """
-        Diagnostic: verify online encoder hasn't collapsed by measuring how
-        well a trainable decoder can reconstruct pixels from its latents.
+        Reconstruction loss through the online encoder → online decoder path.
 
-        Pipeline:
-        1. Encode frames with online encoder  (gradients flow through *decoder*)
-        2. DETACH the latent z               (no gradient to encoder)
-        3. Decode with trainable decoder     (gradients flow through decoder only)
-        4. Loss = mse_weight * MSE + lpips_weight * LPIPS
+        When ``recon_regularizer`` is **False** (default):
+            Latents are detached so only the decoder receives gradients.
+            This serves as a pure diagnostic / visualization probe.
+
+        When ``recon_regularizer`` is **True**:
+            Gradients flow through the encoder too, acting as a
+            reconstruction-based regularizer that prevents collapse.
+
+        Loss = mse_weight * MSE + lpips_weight * LPIPS
 
         Args:
             videos: (B, T, 3, H, W) raw frames in [0, 1]
@@ -407,17 +438,29 @@ class DFoTVideoJEPA(DFoTVideo):
         x_flat = rearrange(videos, "b t c h w -> (b t) c h w")
         x_norm = 2.0 * x_flat - 1.0  # [-1, 1]
 
-        # Encode (no grad to encoder via detach below)
-        h = self.online_encoder(x_norm)
-        moments = self.online_quant_conv(h)
-        mean, _ = torch.chunk(moments, 2, dim=1)
-        z = mean.detach()  # <-- gradient wall: encoder receives no signal
+        recon_reg = self.jepa_cfg.get("recon_regularizer", False)
 
-        # Decode
-        x_recon = self._decode_online(z)  # (B*T, 3, H, W) in [-1, 1]
+        # Use a dedicated small chunk size for the decoder to avoid OOM.
+        # The DFoT + JEPA activations already occupy most of GPU memory by the
+        # time this runs, so the decoder needs its own (smaller) limit.
+        # Training batch_size and vae.batch_size can stay large; only this needs
+        # to be small (2-4 frames is enough for a meaningful loss signal).
+        decoder_bs = self.jepa_cfg.get("decoder_chunk_size", 2)
+        total = x_norm.shape[0]
+        mse_losses: list = []
+        lpips_losses: list = []
+        for start in range(0, total, decoder_bs):
+            x_chunk = x_norm[start : start + decoder_bs]
+            h = self.online_encoder(x_chunk)
+            moments = self.online_quant_conv(h)
+            mean, _ = torch.chunk(moments, 2, dim=1)
+            z = mean if recon_reg else mean.detach()
+            x_recon = self._decode_online(z)
+            mse_losses.append(F.mse_loss(x_recon, x_chunk))
+            lpips_losses.append(self.perceptual_loss(x_recon, x_chunk).mean())
 
-        mse_loss = F.mse_loss(x_recon, x_norm)
-        lpips_loss = self.perceptual_loss(x_recon, x_norm).mean()
+        mse_loss = torch.stack(mse_losses).mean()
+        lpips_loss = torch.stack(lpips_losses).mean()
 
         mse_w = self.jepa_cfg.get("decoder_mse_weight", 1.0)
         lpips_w = self.jepa_cfg.get("decoder_lpips_weight", 1.0)
@@ -427,6 +470,7 @@ class DFoTVideoJEPA(DFoTVideo):
             "decoder/mse_loss": mse_loss.detach(),
             "decoder/lpips_loss": lpips_loss.detach(),
             "decoder/total_loss": decoder_loss.detach(),
+            "decoder/recon_regularizer": torch.tensor(float(recon_reg), device=mse_loss.device),
         }
         return decoder_loss, log_dict
 
@@ -462,14 +506,14 @@ class DFoTVideoJEPA(DFoTVideo):
         posterior = self.vae.encode(x_norm)
         z_target = posterior.mode()
         recon_target = self.vae.decode(z_target)  # [-1, 1]
-        recon_target = ((recon_target.clamp(-1, 1) + 1) / 2).view(1, T, *recon_target.shape[1:])
+        recon_target = ((recon_target.clamp(-1, 1) + 1) / 2).reshape(1, T, *recon_target.shape[1:])
 
         # Online encoder (trainable) + online decoder (trainable)
         h = self.online_encoder(x_norm)
         moments = self.online_quant_conv(h)
         mean, _ = torch.chunk(moments, 2, dim=1)
         recon_online = self._decode_online(mean)  # [-1, 1]
-        recon_online = ((recon_online.clamp(-1, 1) + 1) / 2).view(1, T, *recon_online.shape[1:])
+        recon_online = ((recon_online.clamp(-1, 1) + 1) / 2).reshape(1, T, *recon_online.shape[1:])
 
         # Cast to float32: numpy / torchvision don't support bfloat16
         recon_target = recon_target.float()
@@ -484,7 +528,7 @@ class DFoTVideoJEPA(DFoTVideo):
         # Interleave: (T, 3_sources, C, H, W) -> (3T, C, H, W), make_grid with nrow=3
         frames = torch.stack(
             [recon_target[0], recon_online[0], videos[0]], dim=1
-        ).view(-1, *videos.shape[2:])  # (3T, C, H, W)
+        ).reshape(-1, *videos.shape[2:])  # (3T, C, H, W)
         grid = torchvision.utils.make_grid(frames, nrow=3, padding=2, pad_value=0.5)
         torchvision.utils.save_image(grid, save_path)
 
@@ -505,21 +549,67 @@ class DFoTVideoJEPA(DFoTVideo):
     # -----------------------------------------------------------------
 
     @torch.no_grad()
-    def _ema_update_target_encoder(self) -> None:
+    def _ema_update_target(self) -> None:
         """
-        Exponential moving average update: blend online encoder weights
-        into the target encoder.  Called every ``ema_update_every`` steps.
+        Exponential moving average update: blend online encoder AND decoder
+        weights into the target VAE.  Called every ``ema_update_every`` steps.
+
+        This keeps the target encoder-decoder pair consistent so that
+        _decode() (used during sampling/metrics) stays matched with the
+        evolving target encoder.
         """
         decay = self.ema_decay
+
+        # Encoder
         for p_online, p_target in zip(
             self.online_encoder.parameters(), self.vae.encoder.parameters()
         ):
             p_target.data.mul_(decay).add_(p_online.data, alpha=1.0 - decay)
 
+        # quant_conv (encoder side)
         for p_online, p_target in zip(
             self.online_quant_conv.parameters(), self.vae.quant_conv.parameters()
         ):
             p_target.data.mul_(decay).add_(p_online.data, alpha=1.0 - decay)
+
+        # post_quant_conv (decoder side)
+        for p_online, p_target in zip(
+            self.online_post_quant_conv.parameters(), self.vae.post_quant_conv.parameters()
+        ):
+            p_target.data.mul_(decay).add_(p_online.data, alpha=1.0 - decay)
+
+        # Decoder
+        for p_online, p_target in zip(
+            self.online_decoder.parameters(), self.vae.decoder.parameters()
+        ):
+            p_target.data.mul_(decay).add_(p_online.data, alpha=1.0 - decay)
+
+    @torch.no_grad()
+    def _update_running_latent_stats(self, raw_latents: Tensor) -> None:
+        """
+        Update running mean/std from a batch of raw (un-normalized) target
+        encoder latents.  Uses exponential moving average so the estimate
+        stays fresh as the target encoder drifts via EMA.
+        """
+        # raw_latents: (B, T, C, H, W)  -- compute per-channel stats
+        # Collapse all dims except C to match data_mean shape
+        mean = raw_latents.mean(dim=(0, 1, 3, 4))  # (C,)
+        std = raw_latents.std(dim=(0, 1, 3, 4))     # (C,)
+
+        # Reshape to match data_mean buffer shape: (C, 1, 1)
+        target_shape = self.data_mean.shape
+        mean = mean.reshape(target_shape)
+        std = std.reshape(target_shape)
+
+        m = self._stats_momentum
+        self._running_mean.mul_(1 - m).add_(mean, alpha=m)
+        self._running_std.mul_(1 - m).add_(std, alpha=m)
+
+    @torch.no_grad()
+    def _refresh_data_stats(self) -> None:
+        """Copy running stats into the normalization buffers."""
+        self.data_mean.copy_(self._running_mean)
+        self.data_std.copy_(self._running_std)
 
     # -----------------------------------------------------------------
     # Optimizers
@@ -607,11 +697,21 @@ class DFoTVideoJEPA(DFoTVideo):
         gt_videos = batch.get("videos", None)
         actions_raw = batch.get("conds", None)
 
-        # DFoT path: encode with frozen target VAE (via parent's _encode)
+        # DFoT path: encode with frozen target VAE.
+        # Encode ONCE and get both sampled (for DFoT) and mode (for JEPA targets)
+        # to avoid running the target encoder twice per step.
         if self.is_latent_diffusion and self.is_latent_online:
-            xs = self._encode(batch["videos"])
+            xs, target_mode = self._encode_target_both(batch["videos"])
+            # Cache mode latents for _compute_jepa_loss
+            self._cached_target_latents = target_mode
         else:
             xs = batch.get("latents", batch["videos"])
+            self._cached_target_latents = None
+
+        # Track running stats of raw latents (before normalization)
+        # so we can refresh data_mean/data_std after EMA updates.
+        if self.training:
+            self._update_running_latent_stats(xs)
 
         xs = self._normalize_x(xs)
 
@@ -635,38 +735,44 @@ class DFoTVideoJEPA(DFoTVideo):
         masks: Tensor,
     ) -> Tuple[Tensor, Dict[str, Tensor]]:
         """
-        Compute JEPA prediction loss on clean latents from the online encoder.
+        Compute JEPA prediction loss (BYOL-style asymmetric).
 
         Pipeline:
-        1. Encode all frames with the online encoder -> clean latents
-        2. Flatten to state vectors
+        1. Encode all frames with the **online** encoder -> predictor inputs
+        2. Encode all frames with the **target** encoder -> prediction targets
         3. Encode actions
-        4. Predictor: (states[:-1], actions[:-1]) -> pred_states
-        5. Loss = smooth_l1(pred_states, states[1:].detach())
+        4. Predictor: (online_states[:-1], actions[:-1]) -> pred_states
+        5. Loss = smooth_l1(pred_states, target_states[1:])
+
+        The asymmetry (online encoder → predictor vs target encoder → targets)
+        combined with EMA is what prevents representation collapse (BYOL).
         """
         B, T = videos.shape[:2]
 
         if T < 2:
             return torch.tensor(0.0, device=videos.device), {}
 
-        # 1. Encode with online encoder (gradients flow through)
+        # 1. Encode with online encoder (gradients flow through encoder + predictor)
         online_latents = self._encode_online(videos)  # (B, T, C, H, W)
+        online_states = online_latents.reshape(B, T, -1)  # (B, T, state_dim)
 
-        # 2. Flatten
-        states = online_latents.view(B, T, -1)  # (B, T, state_dim)
+        # 2. Reuse cached target latents from on_after_batch_transfer
+        #    (avoids running the target encoder a second time)
+        target_latents = self._cached_target_latents  # (B, T, C, H, W)
+        target_states = target_latents.reshape(B, T, -1)  # (B, T, state_dim)
 
         # 3. Encode actions
         action_embeds = self.action_encoder(actions)  # (B, T, action_embed_dim)
 
-        # 4. Inputs and targets
-        states_input = states[:, :-1]             # (B, T-1, state_dim)
-        action_embeds_input = action_embeds[:, :-1]  # (B, T-1, action_embed_dim)
-        states_target = states[:, 1:].detach()    # (B, T-1, state_dim) -- detached!
+        # 4. Inputs (online) and targets (target encoder, already no-grad)
+        states_input = online_states[:, :-1]          # (B, T-1, state_dim)
+        action_embeds_input = action_embeds[:, :-1]   # (B, T-1, action_embed_dim)
+        states_target = target_states[:, 1:]          # (B, T-1, state_dim) -- from target encoder
 
         # 5. Predict
         if self.jepa_training_mode == "autoregressive":
             pred_list = []
-            current = states[:, 0:1]
+            current = online_states[:, 0:1]
             for t in range(T - 1):
                 act_t = action_embeds_input[:, t : t + 1]
                 pred_t = self.predictor(current, act_t)
@@ -720,7 +826,7 @@ class DFoTVideoJEPA(DFoTVideo):
     # -----------------------------------------------------------------
 
     def training_step(self, batch, batch_idx, namespace="training") -> STEP_OUTPUT:
-        """Training step: DFoT loss + JEPA loss, then EMA update."""
+        """Standard training step with automatic optimization."""
         xs, conditions, masks, gt_videos, actions_raw = batch
 
         # =============== DFoT Loss (uses target encoder latents) ===============
@@ -745,27 +851,24 @@ class DFoTVideoJEPA(DFoTVideo):
                 gt_videos, actions_raw, masks,
             )
 
+        main_loss = dfot_loss + self.jepa_loss_weight * jepa_loss
+
         # =============== Decoder Reconstruction Loss (collapse diagnostic) ===============
         decoder_loss = torch.tensor(0.0, device=xs.device)
         decoder_log_dict: Dict[str, Tensor] = {}
-
         decoder_loss_weight = self.jepa_cfg.get("decoder_loss_weight", 0.0)
+
         if gt_videos is not None and decoder_loss_weight > 0:
             decoder_loss, decoder_log_dict = self._compute_decoder_loss(gt_videos)
 
-        # =============== Combined Loss ===============
-        total_loss = (
-            dfot_loss
-            + self.jepa_loss_weight * jepa_loss
-            + decoder_loss_weight * decoder_loss
-        )
+        total_loss = main_loss + decoder_loss_weight * decoder_loss
 
         # =============== Logging ===============
         if batch_idx % self.cfg.logging.loss_freq == 0:
-            self.log(f"{namespace}/loss", total_loss, on_step=True, sync_dist=True)
-            self.log(f"{namespace}/dfot_loss", dfot_loss, on_step=True, sync_dist=True)
-            self.log(f"{namespace}/jepa_loss", jepa_loss, on_step=True, sync_dist=True)
-            self.log(f"{namespace}/decoder_loss", decoder_loss, on_step=True, sync_dist=True)
+            self.log(f"{namespace}/loss", total_loss.detach(), on_step=True, sync_dist=True)
+            self.log(f"{namespace}/dfot_loss", dfot_loss.detach(), on_step=True, sync_dist=True)
+            self.log(f"{namespace}/jepa_loss", jepa_loss.detach(), on_step=True, sync_dist=True)
+            self.log(f"{namespace}/decoder_loss", decoder_loss.detach(), on_step=True, sync_dist=True)
             for key, value in jepa_log_dict.items():
                 self.log(f"{namespace}/{key}", value, on_step=True, sync_dist=True)
             for key, value in decoder_log_dict.items():
@@ -789,10 +892,12 @@ class DFoTVideoJEPA(DFoTVideo):
         }
 
     def on_train_batch_end(self, outputs, batch, batch_idx) -> None:
-        """EMA update of target encoder after each training step (if due)."""
+        """EMA update of target encoder + decoder after each training step (if due)."""
         super().on_train_batch_end(outputs, batch, batch_idx)
         if (self.global_step + 1) % self.ema_update_every == 0:
-            self._ema_update_target_encoder()
+            self._ema_update_target()
+            # Refresh normalization to track the drifting target encoder
+            self._refresh_data_stats()
 
     # -----------------------------------------------------------------
     # Validation
@@ -807,8 +912,8 @@ class DFoTVideoJEPA(DFoTVideo):
         if self.trainer.state.fn == "FIT":
             self._eval_denoising_jepa(parent_batch, batch_idx, namespace=namespace)
 
-        # Decoder reconstruction visualization (once per validation epoch)
-        if gt_videos is not None and batch_idx == 0:
+        # Decoder reconstruction visualization (every validation step)
+        if gt_videos is not None:
             self._log_decoder_reconstructions(
                 gt_videos, namespace="decoder_vis_val", step=self.global_step
             )
@@ -863,8 +968,8 @@ class DFoTVideoJEPA(DFoTVideo):
             gt_videos_vis.shape[0],
         )
         log_video(
-            recons[:num_videos_to_log],
-            gt_videos_vis[:num_videos_to_log],
+            recons[:num_videos_to_log].float(),
+            gt_videos_vis[:num_videos_to_log].float(),
             step=self.global_step,
             namespace="denoising_vis",
             logger=self.logger.experiment,
@@ -877,7 +982,7 @@ class DFoTVideoJEPA(DFoTVideo):
     # -----------------------------------------------------------------
 
     def _should_include_in_checkpoint(self, key: str) -> bool:
-        """Include JEPA components and online encoder in checkpoint."""
+        """Include JEPA components, online encoder, EMA-updated target VAE, and running stats."""
         base_include = super()._should_include_in_checkpoint(key)
         jepa_include = (
             key.startswith("action_encoder")
@@ -886,6 +991,14 @@ class DFoTVideoJEPA(DFoTVideo):
             or key.startswith("online_quant_conv")
             or key.startswith("online_post_quant_conv")
             or key.startswith("online_decoder")
+            # EMA-updated target VAE: must be saved so the target encoder/decoder
+            # can be restored to their drifted state on checkpoint resume.
+            or key.startswith("vae.encoder.")
+            or key.startswith("vae.quant_conv.")
+            or key.startswith("vae.post_quant_conv.")
+            or key.startswith("vae.decoder.")
+            # Running normalization stats (registered buffers)
+            or key.startswith("_running_")
         )
         return base_include or jepa_include
 
@@ -944,4 +1057,9 @@ class DFoTVideoJEPA(DFoTVideo):
                 cyan("  (This is expected when finetuning from pre-trained DFoT)")
             )
 
-        rank_zero_print(cyan(f"VAE will be loaded from: {self.cfg.vae.pretrained_path}"))
+        ckpt_state = checkpoint.get("state_dict", {})
+        vae_in_ckpt = any(k.startswith("vae.encoder.") for k in ckpt_state)
+        if vae_in_ckpt:
+            rank_zero_print(cyan("Target VAE weights will be restored from checkpoint (EMA-updated state)."))
+        else:
+            rank_zero_print(cyan(f"VAE will be loaded from: {self.cfg.vae.pretrained_path}"))
