@@ -19,6 +19,7 @@ jepa:
   # Learning rates
   lr: 1e-4  # for action encoder and ViT predictor
   vae_lr: 1e-5  # for VAE (if trainable)
+  dit_lr: 1e-5  # for DIT (if trainable)
 
   # Whether to train VAE encoder/decoder
   # train_vae_encoder: true  # Train encoder to learn predictable representations
@@ -30,7 +31,9 @@ jepa:
   # SigREG — anti-collapse regularization on online encoder embeddings
   # Pushes latent distribution toward isotropic Gaussian via sliced EP test
   sigreg_loss_weight: 1.0   # weight relative to JEPA pred loss; 0 to disable
+  prediction_loss_weight: 1.0 # weight for JEPA prediction loss (relative to SigREG)
   sigreg_num_slices: 1024   # random projection directions (512-2048 typical)
+  sigreg_proj_dim: 256      # project to lower dim before SigREG (0 to disable)
 
   # Training mode: "teacher_forcing" or "autoregressive"
   # - teacher_forcing: use ground truth states as input (faster, more stable)
@@ -41,8 +44,11 @@ jepa:
   num_vis_videos: 3
 
   # EMA update schedule
-  ema_decay: 0.99
-  ema_update_every: 100  # steps
+  ema_decay: 0.999
+  ema_update_every: 250  # steps
+  encoder_unfreeze_step: 0   # Unfreeze encoder after 5k steps
+  dit_unfreeze_step: 0      # Unfreeze DIT after 10k steps
+  # Leave None to train from start (default)
 
   # Action encoder config
   action_embed_dim: 256
@@ -54,4 +60,4 @@ jepa:
   predictor_heads: 8
   predictor_dim_head: 64
   predictor_mlp_ratio: 4.0
-  predictor_dropout: 0.1
+  predictor_dropout: 0

@@ -34,7 +34,15 @@ from utils.torch_utils import freeze_model
 from utils.distributed_utils import rank_zero_print
 from utils.print_utils import cyan
 from .dfot_video import DFoTVideo
-from .sigreg import SigREG
+
+# Import official LeJEPA implementation
+try:
+    import lejepa
+    USE_LEJEPA = True
+except ImportError:
+    # Fallback to custom standalone implementation
+    from .sigreg import SigREG
+    USE_LEJEPA = False
 
 
 # =============================================================================
@@ -180,9 +188,8 @@ class ViTPredictor(nn.Module):
 
         for layer in self.layers:
             x = layer(x)
-
         x = self.norm(x)
-        return self.output_proj(x)
+        return states + self.output_proj(x)  # residual: predict delta, start from copy
 
 
 class ActionEncoder(nn.Module):
@@ -221,12 +228,25 @@ class DFoTVideoJEPA(DFoTVideo):
         self.jepa_training_mode = cfg.jepa.get("training_mode", "teacher_forcing")
 
         # SigREG config
+        self.prediction_loss_weight = cfg.jepa.get("prediction_loss_weight", 1.0)
         self.sigreg_loss_weight = cfg.jepa.get("sigreg_loss_weight", 1.0)
         self.sigreg_num_slices = cfg.jepa.get("sigreg_num_slices", 1024)
+        self.sigreg_proj_dim = cfg.jepa.get("sigreg_proj_dim", 256)
+
+        # Cosine similarity loss weight
+        self.lambda_cos = cfg.jepa.get("lambda_cos", 0.5)
 
         # EMA config
         self.ema_decay = cfg.jepa.get("ema_decay", 0.99)
         self.ema_update_every = cfg.jepa.get("ema_update_every", 100)
+        print(cyan(f"JEPA EMA decay: {self.ema_decay}, update every: {self.ema_update_every} steps"))
+
+        # Progressive unfreezing: encoder and DIT training start after N steps
+        self.encoder_unfreeze_step = cfg.jepa.get("encoder_unfreeze_step", None)  # None = train from start
+        self.dit_unfreeze_step = cfg.jepa.get("dit_unfreeze_step", None)  # None = train from start
+        print(cyan(f"JEPA encoder unfreeze step: {self.encoder_unfreeze_step}, DIT unfreeze step: {self.dit_unfreeze_step}"))
+        self._encoder_unfrozen = False
+        self._dit_unfrozen = False
 
         # Fixed probe videos for visualisation (captured lazily on first validation call)
         self._jepa_vis_videos: Optional[Tensor] = None   # (N, T, 3, H, W) on CPU
@@ -279,7 +299,36 @@ class DFoTVideoJEPA(DFoTVideo):
         )
 
         # SigREG — anti-collapse regularization on online encoder embeddings
-        self.sigreg = SigREG(num_slices=self.sigreg_num_slices)
+        if USE_LEJEPA:
+            # Use official LeJEPA implementation
+            try:
+                # Try the proper LeJEPA API
+                univariate_test = lejepa.univariate.EppsPulley()
+                self.sigreg = lejepa.multivariate.SlicingUnivariateTest(
+                    univariate_test=univariate_test,
+                    num_slices=self.sigreg_num_slices,
+                )
+                rank_zero_print(cyan("✓ Using official LeJEPA SigREG implementation"))
+            except Exception as e:
+                # Fallback if LeJEPA API is different
+                rank_zero_print(cyan(f"⚠ LeJEPA init failed ({e}), using custom SigREG"))
+                self.sigreg = SigREG(num_slices=self.sigreg_num_slices)
+        else:
+            # Fallback to custom standalone implementation
+            self.sigreg = SigREG(num_slices=self.sigreg_num_slices)
+            rank_zero_print(cyan("⚠ Using custom SigREG implementation (LeJEPA not installed)"))
+
+        # SigREG projection: project from state_dim to lower dim before SigREG
+        if self.sigreg_proj_dim > 0:
+            self.sigreg_proj = nn.Sequential(
+                nn.Linear(self.state_dim, self.sigreg_proj_dim),
+                nn.LayerNorm(self.sigreg_proj_dim),
+                nn.GELU(),
+                nn.Linear(self.sigreg_proj_dim, self.sigreg_proj_dim),
+            )
+            rank_zero_print(cyan(f"JEPA SigREG projection: {self.state_dim} -> {self.sigreg_proj_dim}"))
+        else:
+            self.sigreg_proj = None
 
         rank_zero_print(cyan(f"JEPA State dim: {self.state_dim}"))
         rank_zero_print(cyan(f"JEPA Predictor hidden dim: {jepa_cfg.predictor_hidden_dim}"))
@@ -396,6 +445,37 @@ class DFoTVideoJEPA(DFoTVideo):
             p_target.data.mul_(decay).add_(p_online.data, alpha=1.0 - decay)
 
     # -----------------------------------------------------------------
+    # Progressive Unfreezing
+    # -----------------------------------------------------------------
+
+    def _update_component_freezing(self) -> None:
+        """
+        Progressive unfreezing: gradually enable training of encoder and DIT
+        at specified steps for curriculum learning.
+        """
+        # Unfreeze encoder at specified step
+        if self.encoder_unfreeze_step is not None and self.global_step == self.encoder_unfreeze_step:
+            if not self._encoder_unfrozen:
+                for p in self.online_encoder.parameters():
+                    p.requires_grad = True
+                for p in self.online_quant_conv.parameters():
+                    p.requires_grad = True
+                self._encoder_unfrozen = True
+                rank_zero_print(
+                    cyan(f"✓ Unfroze online encoder at step {self.global_step}")
+                )
+
+        # Unfreeze DIT at specified step
+        if self.dit_unfreeze_step is not None and self.global_step == self.dit_unfreeze_step:
+            if not self._dit_unfrozen:
+                for p in self.diffusion_model.parameters():
+                    p.requires_grad = True
+                self._dit_unfrozen = True
+                rank_zero_print(
+                    cyan(f"✓ Unfroze DIT (diffusion model) at step {self.global_step}")
+                )
+
+    # -----------------------------------------------------------------
     # Optimizers
     # -----------------------------------------------------------------
 
@@ -404,16 +484,24 @@ class DFoTVideoJEPA(DFoTVideo):
         params_groups = []
 
         # 1. Diffusion model (backbone -- trained by DFoT loss only)
+        # Initially frozen if dit_unfreeze_step is set
+        dit_params = list(self.diffusion_model.parameters())
+        if self.dit_unfreeze_step is not None:
+            for p in dit_params:
+                p.requires_grad = False
+            rank_zero_print(cyan(f"Freezing DIT until step {self.dit_unfreeze_step}"))
+        
         params_groups.append({
-            "params": list(self.diffusion_model.parameters()),
-            "lr": self.cfg.lr,
+            "params": dit_params,
+            "lr":  self.cfg.lr,  # Lower LR for stability when training with JEPA
             "name": "diffusion",
         })
 
-        # 2. JEPA predictor + action encoder
+        # 2. JEPA predictor + action encoder + sigreg projection
         jepa_params = (
             list(self.predictor.parameters()) +
-            list(self.action_encoder.parameters())
+            list(self.action_encoder.parameters()) +
+            (list(self.sigreg_proj.parameters()) if self.sigreg_proj is not None else [])
         )
         params_groups.append({
             "params": jepa_params,
@@ -422,13 +510,19 @@ class DFoTVideoJEPA(DFoTVideo):
         })
 
         # 3. Online encoder (lower LR for stability)
+        # Initially frozen if encoder_unfreeze_step is set
         online_params = (
             list(self.online_encoder.parameters()) +
             list(self.online_quant_conv.parameters())
         )
+        if self.encoder_unfreeze_step is not None:
+            for p in online_params:
+                p.requires_grad = False
+            rank_zero_print(cyan(f"Freezing online encoder until step {self.encoder_unfreeze_step}"))
+        
         params_groups.append({
             "params": online_params,
-            "lr": self.jepa_cfg.get("encoder_lr", 1e-5),
+            "lr": self.jepa_cfg.get("encoder_lr", 5e-5),
             "name": "online_encoder",
         })
 
@@ -520,6 +614,8 @@ class DFoTVideoJEPA(DFoTVideo):
 
         # 2b. SigREG on online embeddings (pool across time → one vector per sample)
         sigreg_input = states.reshape(B * T, -1)  # (B*T, state_dim)
+        if self.sigreg_proj is not None:
+            sigreg_input = self.sigreg_proj(sigreg_input)  # (B*T, sigreg_proj_dim)
         sigreg_loss = self.sigreg(sigreg_input)
 
         # 3. Encode actions
@@ -545,11 +641,21 @@ class DFoTVideoJEPA(DFoTVideo):
             # Teacher forcing (default)
             states_pred = self.predictor(states_input, action_embeds_input)
 
+        # 2c. SigREG on predicted embeddings (prevent predictor collapse)
+        sigreg_input_pred = states_pred.reshape(-1, self.state_dim)  # (B*(T-1), state_dim)
+        if self.sigreg_proj is not None:
+            sigreg_input_pred = self.sigreg_proj(sigreg_input_pred)  # (B*(T-1), sigreg_proj_dim)
+        sigreg_loss_pred = self.sigreg(sigreg_input_pred)
+
         # 6. Loss
         transition_masks = masks[:, :-1] & masks[:, 1:]
 
-        pred_loss = F.smooth_l1_loss(
-            states_pred, states_target, reduction="none"
+        # Normalize latents for direction-focused losses
+        states_pred_norm = F.normalize(states_pred, dim=-1)
+        states_target_norm = F.normalize(states_target, dim=-1)
+
+        pred_loss = F.mse_loss(
+            states_pred_norm, states_target_norm, reduction="none"
         ).mean(dim=-1)  # (B, T-1)
 
         if transition_masks.sum() > 0:
@@ -559,30 +665,70 @@ class DFoTVideoJEPA(DFoTVideo):
         else:
             pred_loss = pred_loss.mean()
 
+        # Cosine similarity loss (directional alignment)
+        # cos_sim_pred = F.cosine_similarity(states_pred_norm, states_target_norm, dim=-1)  # (B, T-1)
+        # cos_sim_loss = 1.0 - cos_sim_pred  # Loss in [0, 2], minimized when cos_sim = 1
+
+        # if transition_masks.sum() > 0:
+        #     cos_sim_loss = (cos_sim_loss * transition_masks.float()).sum() / transition_masks.sum()
+        # else:
+        #     cos_sim_loss = cos_sim_loss.mean()
+
         # Metrics
         with torch.no_grad():
+            # Copy baseline: how good is s_t as a prediction of s_{t+1}?
+            copy_pred_norm = F.normalize(states_input, dim=-1)
+            copy_loss = F.mse_loss(
+                copy_pred_norm, states_target_norm, reduction="none"
+            ).mean(dim=-1)  # (B, T-1)
+            if transition_masks.sum() > 0:
+                copy_loss = (copy_loss * transition_masks.float()).sum() / transition_masks.sum()
+            else:
+                copy_loss = copy_loss.mean()
+
+            # Predictor output stats
+            pred_norm_mean = states_pred.norm(dim=-1).mean()
+            target_norm_mean = states_target.norm(dim=-1).mean()
+            pred_std_across_batch = states_pred.std(dim=0).mean()
+
             if transition_masks.sum() > 0:
                 mse = F.mse_loss(
-                    states_pred[transition_masks],
-                    states_target[transition_masks],
+                    states_pred_norm[transition_masks],
+                    states_target_norm[transition_masks],
                 )
                 cos_sim = F.cosine_similarity(
-                    states_pred[transition_masks],
-                    states_target[transition_masks],
+                    states_pred_norm[transition_masks],
+                    states_target_norm[transition_masks],
                     dim=-1,
                 ).mean()
             else:
                 mse = torch.tensor(0.0, device=videos.device)
                 cos_sim = torch.tensor(0.0, device=videos.device)
 
-        # Combine prediction loss + SigREG
-        total_jepa_loss = pred_loss + self.sigreg_loss_weight * sigreg_loss
+        # Combine prediction loss + cosine similarity loss + SigREG (encoder + predictor)
+        sigreg_loss_pred = 0
+        total_jepa_loss = (
+            self.prediction_loss_weight * pred_loss + 
+            #self.lambda_cos * cos_sim_loss +
+            self.sigreg_loss_weight * (sigreg_loss + sigreg_loss_pred)
+        )
 
         log_dict = {
             "jepa/pred_loss": pred_loss,
-            "jepa/sigreg_loss": sigreg_loss,
+            "jepa/copy_baseline_loss": copy_loss,
+            "jepa/pred_vs_copy_ratio": pred_loss / (copy_loss + 1e-8),
+            #"jepa/cos_sim_loss": cos_sim_loss,
+            "jepa/sigreg_loss_encoder": sigreg_loss,
+            "jepa/sigreg_loss_predictor": sigreg_loss_pred,
+            "jepa/sigreg_loss": sigreg_loss + sigreg_loss_pred,
             "jepa/mse": mse,
             "jepa/cos_sim": cos_sim,
+            "jepa/pred_norm_mean": pred_norm_mean,
+            "jepa/target_norm_mean": target_norm_mean,
+            "jepa/pred_std_across_batch": pred_std_across_batch,
+            "jepa/weighted_pred_loss": self.prediction_loss_weight * pred_loss,
+            #"jepa/weighted_cos_sim_loss": self.lambda_cos * cos_sim_loss,
+            "jepa/weighted_sigreg_loss": self.sigreg_loss_weight * (sigreg_loss + sigreg_loss_pred),
         }
         return total_jepa_loss, log_dict
 
@@ -592,6 +738,9 @@ class DFoTVideoJEPA(DFoTVideo):
 
     def training_step(self, batch, batch_idx, namespace="training") -> STEP_OUTPUT:
         """Training step: DFoT loss + JEPA loss, then EMA update."""
+        # Progressive unfreezing: check if we should unfreeze components
+        self._update_component_freezing()
+
         xs, conditions, masks, gt_videos, actions_raw = batch
 
         # =============== DFoT Loss (uses target encoder latents) ===============
@@ -617,8 +766,8 @@ class DFoTVideoJEPA(DFoTVideo):
             )
 
         # =============== Combined Loss ===============
-        total_loss = dfot_loss + self.jepa_loss_weight * jepa_loss
-
+        total_loss =  dfot_loss + self.jepa_loss_weight * jepa_loss #+ self.sigreg_loss_weight * jepa_log_dict.get("jepa/sigreg_loss", 0.0)
+       
         # =============== Logging ===============
         if batch_idx % self.cfg.logging.loss_freq == 0:
             self.log(f"{namespace}/loss", total_loss, on_step=True, sync_dist=True)
@@ -641,7 +790,9 @@ class DFoTVideoJEPA(DFoTVideo):
         """EMA update of target encoder after each training step (if due)."""
         super().on_train_batch_end(outputs, batch, batch_idx)
         if (self.global_step + 1) % self.ema_update_every == 0:
-            self._ema_update_target_encoder()
+            # Only update EMA if DIT is unfrozen (or if no freezing configured)
+            if self.dit_unfreeze_step is None or self._dit_unfrozen:
+                self._ema_update_target_encoder()
 
     # -----------------------------------------------------------------
     # Validation
@@ -656,6 +807,7 @@ class DFoTVideoJEPA(DFoTVideo):
         if self.trainer.state.fn == "FIT":
             self._eval_denoising_jepa(parent_batch, batch_idx, namespace=namespace)
             self._log_jepa_embeddings(gt_videos, actions_raw, namespace=namespace)
+            self._log_jepa_upsampled_images(gt_videos, actions_raw, namespace=namespace)
 
         if not (
             self.trainer.sanity_checking and not self.cfg.logging.sanity_generation
@@ -664,6 +816,23 @@ class DFoTVideoJEPA(DFoTVideo):
             if all_videos is not None:
                 self._update_metrics(all_videos)
                 self._log_videos(all_videos, namespace)
+
+            # Save JEPA embeddings (shape: B, T, C, H, W in latent space)
+            if self.logging.save_embeddings:
+                if namespace not in self.validation_embeddings:
+                    self.validation_embeddings[namespace] = {}
+                entry = {}
+                if gt_videos is not None:
+                    entry["gt"] = self._encode_online(gt_videos).detach().float().cpu()
+                if all_videos is not None and "prediction" in all_videos:
+                    entry["prediction"] = self._encode_online(
+                        all_videos["prediction"]
+                    ).detach().float().cpu()
+                self.validation_embeddings[namespace][batch_idx] = entry
+                rank_zero_print(
+                    cyan(f"✓ Stored JEPA embeddings for batch {batch_idx} "
+                         f"keys={list(entry.keys())} (namespace={namespace})")
+                )
 
     def _eval_denoising_jepa(self, batch, batch_idx, namespace="training") -> None:
         """Evaluate denoising -- adapted for the 5-element batch."""
@@ -737,6 +906,7 @@ class DFoTVideoJEPA(DFoTVideo):
         import numpy as np
         import wandb
         from utils.distributed_utils import is_rank_zero
+        # import pdb; pdb.set_trace()
 
         if not (is_rank_zero and self.logger):
             return
@@ -785,17 +955,27 @@ class DFoTVideoJEPA(DFoTVideo):
             target_vis = torch.cat([target_vis, pad], dim=2)
             pred_vis   = torch.cat([pred_vis,   pad], dim=2)
 
-        # 5. Per-sample min-max normalise to [0, 1]
+        # 5. Per-sample min-max normalise to [0, 1] using SHARED min/max
         # Collapse shows as uniform grey; healthy latents show spatial structure.
-        def minmax_norm(x: Tensor) -> Tensor:
-            # x: (N, T-1, 3, H, W) — normalise per probe video
-            flat = x.reshape(x.shape[0], -1)
-            mn = flat.min(dim=1).values[:, None, None, None, None]
-            mx = flat.max(dim=1).values[:, None, None, None, None]
-            return (x - mn) / (mx - mn + 1e-8)
+        def minmax_norm_shared(target: Tensor, pred: Tensor) -> Tuple[Tensor, Tensor]:
+            # Compute min/max across both target and pred per sample
+            # x: (N, T-1, 3, H, W) — normalise per probe video using same scale
+            flat_target = target.reshape(target.shape[0], -1)
+            flat_pred = pred.reshape(pred.shape[0], -1)
+            
+            # Global min/max per sample across both target and pred
+            mn = torch.minimum(
+                flat_target.min(dim=1).values, 
+                flat_pred.min(dim=1).values
+            )[:, None, None, None, None]
+            mx = torch.maximum(
+                flat_target.max(dim=1).values, 
+                flat_pred.max(dim=1).values
+            )[:, None, None, None, None]
+            
+            return (target - mn) / (mx - mn + 1e-8), (pred - mn) / (mx - mn + 1e-8)
 
-        target_vis = minmax_norm(target_vis)
-        pred_vis   = minmax_norm(pred_vis)
+        target_vis, pred_vis = minmax_norm_shared(target_vis, pred_vis)
 
         # 6. Flatten to (N*(T-1), 3, H, W) for logging
         target_grid = target_vis.reshape(-1, 3, latent_h, latent_w)
@@ -841,6 +1021,108 @@ class DFoTVideoJEPA(DFoTVideo):
             log_dict[f"jepa_vis/{namespace}/gifs/predicted_vid{v}"] = wandb.Video(
                 to_video_uint8(pred_vis[v]), fps=4, format="gif"
             )
+
+        wandb.log(log_dict, step=self.global_step, commit=False)
+
+    @torch.no_grad()
+    def _log_jepa_upsampled_images(
+        self,
+        gt_videos: Tensor,
+        actions_raw: Tensor,
+        namespace: str = "validation",
+    ) -> None:
+        """
+        Log 64x64 upsampled JEPA latent frames to W&B.
+
+        Reuses the same probe videos captured by ``_log_jepa_embeddings``.
+        Logged under ``jepa_vis_64/{namespace}/frames/target`` and
+        ``jepa_vis_64/{namespace}/frames/predicted``.
+        """
+        import numpy as np
+        import wandb
+        import torch.nn.functional as F
+        from utils.distributed_utils import is_rank_zero
+
+        if not (is_rank_zero and self.logger):
+            return
+        if self._jepa_vis_videos is None:
+            return  # probe videos not yet captured
+
+        vis_videos = self._jepa_vis_videos.to(
+            device=gt_videos.device, dtype=gt_videos.dtype
+        )
+        vis_actions = self._jepa_vis_actions.to(
+            device=actions_raw.device, dtype=actions_raw.dtype
+        )
+        N, T = vis_videos.shape[:2]
+        if T < 2:
+            return
+
+        # 1. Encode & predict (same as _log_jepa_embeddings)
+        online_latents = self._encode_online(vis_videos)  # (N, T, C, H, W)
+        C, latent_h, latent_w = online_latents.shape[2:]
+
+        states = online_latents.reshape(N, T, -1)
+        action_embeds = self.action_encoder(vis_actions)
+        states_pred = self.predictor(states[:, :-1], action_embeds[:, :-1])
+
+        target_latents = online_latents[:, 1:]  # (N, T-1, C, H, W)
+        pred_latents = states_pred.reshape(N, T - 1, C, latent_h, latent_w)
+
+        # 2. First 3 channels, pad to 3 if needed
+        vis_ch = min(3, C)
+        target_vis = target_latents[:, :, :vis_ch]
+        pred_vis = pred_latents[:, :, :vis_ch]
+        if vis_ch < 3:
+            pad_shape = (*target_vis.shape[:2], 3 - vis_ch, latent_h, latent_w)
+            pad = torch.zeros(pad_shape, device=target_vis.device)
+            target_vis = torch.cat([target_vis, pad], dim=2)
+            pred_vis = torch.cat([pred_vis, pad], dim=2)
+
+        # 3. Per-sample min-max normalise to [0, 1] using SHARED min/max
+        def minmax_norm_shared(target: Tensor, pred: Tensor) -> Tuple[Tensor, Tensor]:
+            # Compute min/max across both target and pred per sample
+            flat_target = target.reshape(target.shape[0], -1)
+            flat_pred = pred.reshape(pred.shape[0], -1)
+            
+            # Global min/max per sample across both target and pred
+            mn = torch.minimum(
+                flat_target.min(dim=1).values, 
+                flat_pred.min(dim=1).values
+            )[:, None, None, None, None]
+            mx = torch.maximum(
+                flat_target.max(dim=1).values, 
+                flat_pred.max(dim=1).values
+            )[:, None, None, None, None]
+            
+            return (target - mn) / (mx - mn + 1e-8), (pred - mn) / (mx - mn + 1e-8)
+
+        target_vis, pred_vis = minmax_norm_shared(target_vis, pred_vis)
+
+        # 4. Flatten to (N*(T-1), 3, H, W) then upsample 32x32 -> 64x64
+        target_grid = target_vis.reshape(-1, 3, latent_h, latent_w)
+        pred_grid = pred_vis.reshape(-1, 3, latent_h, latent_w)
+
+        target_64 = F.interpolate(target_grid, size=(64, 64), mode="nearest")
+        pred_64 = F.interpolate(pred_grid, size=(64, 64), mode="nearest")
+
+        def to_hwc_uint8(t: Tensor) -> list:
+            arr = (t.detach().cpu().float().numpy() * 255).astype(np.uint8)
+            return list(np.transpose(arr, (0, 2, 3, 1)))
+
+        captions = [
+            f"vid{v} t{t}->{t+1}" for v in range(N) for t in range(T - 1)
+        ]
+
+        log_dict: dict = {}
+        log_dict[f"jepa_vis_64/{namespace}/frames/target"] = [
+            wandb.Image(img, caption=cap)
+            for img, cap in zip(to_hwc_uint8(target_64), captions)
+        ]
+        log_dict[f"jepa_vis_64/{namespace}/frames/predicted"] = [
+            wandb.Image(img, caption=cap)
+            for img, cap in zip(to_hwc_uint8(pred_64), captions)
+        ]
 
         wandb.log(log_dict, step=self.global_step, commit=False)
 
