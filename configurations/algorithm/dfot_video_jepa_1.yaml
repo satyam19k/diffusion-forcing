@@ -1,0 +1,53 @@
+# DFoT with JEPA — ConvPredictor variant
+# This config extends dfot_video.yaml with JEPA + ConvPredictor settings
+
+defaults:
+  - dfot_video
+
+# Disable torch.compile for JEPA (not verified for this model type)
+compile: false
+
+# JEPA-specific configuration
+jepa:
+  # Loss weight for JEPA prediction loss (combined with DFoT loss)
+  loss_weight: 1.0
+
+  # Reconstruction loss weight (from original config, kept for compatibility)
+  recon_loss_weight: 0.5
+
+  # Learning rates
+  lr: 1e-4  # for ConvPredictor (includes action encoder)
+  vae_lr: 1e-5
+  dit_lr: 1e-5
+
+  # SigREG — anti-collapse regularization
+  sigreg_loss_weight: 1.0
+  prediction_loss_weight: 1.0
+  sigreg_num_slices: 1024
+  sigreg_proj_dim: 0
+
+  # Training mode: "teacher_forcing" or "autoregressive"
+  training_mode: teacher_forcing
+
+  # Number of fixed probe videos for validation logging
+  num_vis_videos: 3
+
+  # EMA update schedule
+  ema_decay: 0.999
+  ema_update_every: 100
+  encoder_unfreeze_step: 0
+  dit_unfreeze_step: 0
+
+  # --- ConvPredictor config ---
+  conv_pred_d_model: 512
+  conv_pred_n_heads: 8
+  conv_pred_num_layers: 6
+  conv_pred_dropout: 0.0
+  conv_pred_mlp_mult: 4.0
+  conv_pred_conditioning: cross_attn    # "cross_attn" or "adaln_film"
+  conv_pred_action_enc_layers: 2
+  conv_pred_identity_init: false
+  conv_pred_pos_emb: learned            # "rope", "learned", or "none"
+  conv_pred_kernel_size: 3
+  conv_pred_norm_groups: 32
+  conv_pred_action_enc_type: new        # "new" (AdaLayerNorm) or "old" (standard)

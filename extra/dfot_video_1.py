@@ -78,8 +78,6 @@ class DFoTVideo(BasePytorchAlgo):
         ]
         self.num_logged_videos = 0
         self.generator = None
-        self.validation_embeddings = {}  # dict to store embeddings during validation
-        self._log_training_gaussian_next = False  # flag to log training embedding plots after validation
 
         super().__init__(cfg)
 
@@ -324,11 +322,6 @@ class DFoTVideo(BasePytorchAlgo):
                 sync_dist=True,
             )
 
-        # Log training Gaussian-check plots on the first step after each validation
-        if self._log_training_gaussian_next and is_rank_zero:
-            self._log_training_gaussian_next = False
-            self._log_gaussian_plots_to_wandb(xs, namespace="training")
-
         xs, xs_pred = map(self._unnormalize_x, (xs, xs_pred))
 
         output_dict = {
@@ -369,17 +362,6 @@ class DFoTVideo(BasePytorchAlgo):
             all_videos = self._sample_all_videos(batch, batch_idx, namespace)
             self._update_metrics(all_videos)
             self._log_videos(all_videos, namespace)
-            
-            # Store embeddings if enabled (ONLY if all_videos is not None)
-            if self.logging.save_embeddings and all_videos is not None:
-                if namespace not in self.validation_embeddings:
-                    self.validation_embeddings[namespace] = {}
-                self.validation_embeddings[namespace][batch_idx] = {
-                    k: v.detach().cpu() for k, v in all_videos.items()
-                }
-                rank_zero_print(
-                    cyan(f"✓ Stored embeddings for batch {batch_idx} (namespace={namespace})")
-                )
 
     def on_validation_epoch_start(self) -> None:
         if self.cfg.logging.deterministic is not None:
@@ -389,8 +371,6 @@ class DFoTVideo(BasePytorchAlgo):
             )
         if self.is_latent_diffusion and not self.is_latent_online:
             self._load_vae()
-        # Initialize embeddings storage for this validation epoch
-        self.validation_embeddings = {}
 
     def on_validation_epoch_end(self, namespace="validation") -> None:
         self.generator = None
@@ -400,22 +380,6 @@ class DFoTVideo(BasePytorchAlgo):
 
         if self.trainer.sanity_checking and not self.cfg.logging.sanity_generation:
             return
-
-        # Save embeddings if enabled
-        if self.logging.save_embeddings and is_rank_zero:
-            self._save_embeddings(namespace)
-
-            # Log Gaussian-check plots to W&B for the first batch's "gt" embeddings
-            if (
-                namespace in self.validation_embeddings
-                and self.validation_embeddings[namespace]
-            ):
-                first_batch_idx = next(iter(self.validation_embeddings[namespace]))
-                batch_embs = self.validation_embeddings[namespace][first_batch_idx]
-                if "gt" in batch_embs:
-                    self._log_gaussian_plots_to_wandb(batch_embs["gt"], namespace="validation")
-                # Flag: log training embeddings on the very next training step
-                self._log_training_gaussian_next = True
 
         for task in self.tasks:
             self.log_dict(
@@ -563,7 +527,7 @@ class DFoTVideo(BasePytorchAlgo):
             sliding_context_len=self.cfg.tasks.prediction.sliding_context_len
             or self.max_tokens // 2,
         )
-        xs_pred[:, keyframe_indices] = xs_pred_key.clone()
+        xs_pred[:, keyframe_indices] = xs_pred_key
         # if is_rank_zero: # uncomment to visualize history guidance
         #     history_guidance.log(logger=self.logger)
 
@@ -819,219 +783,6 @@ class DFoTVideo(BasePytorchAlgo):
             )
 
         self.num_logged_videos += batch_size
-
-    def _save_embeddings(self, namespace: str = "validation") -> None:
-        """
-        Save embedding/latent values to local disk with relevant filenames during validation.
-        
-        Saves to: <output_dir>/embeddings/<namespace>_step_<global_step>/batch_<idx>/<video_type>.npz
-        Format: Compressed NumPy (.npz) and PyTorch (.pt) containing the embedding tensor
-        """
-        import hydra
-        from pathlib import Path
-        
-        # Get the actual output directory (e.g., /scratch/sk12075/diffusion-forcing/outputs/2026-02-17/20-04-32/)
-        output_dir = Path(
-            hydra.core.hydra_config.HydraConfig.get()["runtime"]["output_dir"]
-        )
-        
-        # Determine where to save embeddings
-        if self.logging.embeddings_dir is not None:
-            embeddings_root = Path(self.logging.embeddings_dir)
-        else:
-            embeddings_root = output_dir / "embeddings"
-        
-        # Create directory structure: embeddings/validation_step_<global_step>/
-        step_dir = embeddings_root / f"{namespace}_step_{self.global_step}"
-        step_dir.mkdir(parents=True, exist_ok=True)
-        
-        # DEBUG: Check if embeddings dict is populated
-        if namespace not in self.validation_embeddings:
-            rank_zero_print(
-                cyan(f"⚠️  WARNING: No embeddings dict for namespace='{namespace}'")
-            )
-            rank_zero_print(
-                cyan(f"   Available namespaces: {list(self.validation_embeddings.keys())}")
-            )
-            return
-        
-        embeddings_dict = self.validation_embeddings[namespace]
-        if not embeddings_dict:
-            rank_zero_print(
-                cyan(f"⚠️  WARNING: Embeddings dict is EMPTY for namespace='{namespace}'")
-            )
-            return
-        
-        rank_zero_print(
-            cyan(f"📁 Saving {len(embeddings_dict)} batches of embeddings to: {step_dir}")
-        )
-        
-        # Save embeddings from all batches collected during this validation epoch
-        total_files = 0
-        for batch_idx, batch_embeddings in embeddings_dict.items():
-            batch_dir = step_dir / f"batch_{batch_idx:03d}"
-            batch_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Save each video type (gt, prediction, interpolation, etc.)
-            for video_type, video_tensor in batch_embeddings.items():
-                try:
-                    video_np = video_tensor.numpy()
-                    
-                    # Save as compressed NPZ (with metadata)
-                    npz_path = batch_dir / f"{video_type}.npz"
-                    np.savez_compressed(
-                        npz_path, 
-                        data=video_np,
-                        shape=video_np.shape,
-                        dtype=str(video_np.dtype)
-                    )
-                    
-                    # Save as raw PyTorch tensor as well (for easier loading)
-                    pt_path = batch_dir / f"{video_type}.pt"
-                    torch.save(video_tensor, pt_path)
-                    
-                    rank_zero_print(
-                        f"  ✓ batch_{batch_idx:03d}/{video_type:12s} | shape: {str(video_np.shape):20s}"
-                    )
-                    total_files += 2
-                except Exception as e:
-                    rank_zero_print(
-                        f"  ❌ ERROR saving {video_type}: {str(e)}"
-                    )
-        
-        # Log summary
-        rank_zero_print(
-            cyan(f"✅ Saved {total_files} embedding files to: {step_dir}\n")
-        )
-
-    def _create_gaussian_check_figures(
-        self,
-        data: torch.Tensor,
-        title_prefix: str = "Validation",
-        video_idx: int = 0,
-        frame_indices: list = None,
-        channel_indices: list = None,
-    ):
-        """
-        Create histogram + Q-Q figures to check if embeddings are Gaussian.
-
-        Args:
-            data: Tensor of shape (B, T, C, H, W) — embedding/latent values.
-            title_prefix: Label for the plot title (e.g. "Validation" or "Training").
-            video_idx: Which video (batch element) to plot.
-            frame_indices: Which frames to plot. Defaults to [0, 5, 10, 15].
-            channel_indices: Which channels to plot. Defaults to [0, 1, 2] (3 of 4).
-
-        Returns:
-            (hist_fig, qq_fig) — two matplotlib Figure objects.
-        """
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from scipy import stats as sp_stats
-
-        if isinstance(data, torch.Tensor):
-            data = data.detach().cpu().numpy()
-
-        B, T, C, H, W = data.shape
-        video_idx = min(video_idx, B - 1)
-
-        if frame_indices is None:
-            # Pick up to 4 evenly spaced frames
-            if T >= 16:
-                frame_indices = [0, 5, 10, 15]
-            else:
-                frame_indices = list(range(min(T, 4)))
-        frame_indices = [f for f in frame_indices if f < T]
-
-        if channel_indices is None:
-            channel_indices = list(range(min(C, 3)))  # 3 of 4 channels
-
-        n_rows = len(frame_indices)
-        n_cols = len(channel_indices)
-
-        # --- Histogram figure ---
-        hist_fig, hist_axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
-        if n_rows == 1:
-            hist_axes = hist_axes[np.newaxis, :]
-        if n_cols == 1:
-            hist_axes = hist_axes[:, np.newaxis]
-
-        for row, f_idx in enumerate(frame_indices):
-            for col, c_idx in enumerate(channel_indices):
-                ax = hist_axes[row, col]
-                vals = data[video_idx, f_idx, c_idx].flatten()
-
-                ax.hist(vals, bins=40, density=True, alpha=0.6,
-                        color="steelblue", edgecolor="black", linewidth=0.5)
-
-                mu, sigma = float(np.mean(vals)), float(np.std(vals))
-                x = np.linspace(vals.min() - 0.5, vals.max() + 0.5, 200)
-                ax.plot(x, sp_stats.norm.pdf(x, mu, sigma), "r-", linewidth=2,
-                        label=f"N({mu:.2f}, {sigma:.2f})")
-
-                _, p_val = sp_stats.shapiro(vals)
-                ax.set_title(f"F{f_idx} Ch{c_idx}  p={p_val:.4f}", fontsize=9)
-                ax.legend(fontsize=7)
-                ax.grid(True, alpha=0.3)
-
-        hist_fig.suptitle(
-            f"{title_prefix} — Histograms vs Gaussian (step {self.global_step})",
-            fontsize=13, fontweight="bold",
-        )
-        hist_fig.tight_layout(rect=[0, 0, 1, 0.96])
-
-        # --- Q-Q figure ---
-        qq_fig, qq_axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
-        if n_rows == 1:
-            qq_axes = qq_axes[np.newaxis, :]
-        if n_cols == 1:
-            qq_axes = qq_axes[:, np.newaxis]
-
-        for row, f_idx in enumerate(frame_indices):
-            for col, c_idx in enumerate(channel_indices):
-                ax = qq_axes[row, col]
-                vals = data[video_idx, f_idx, c_idx].flatten()
-                sp_stats.probplot(vals, dist="norm", plot=ax)
-                ax.set_title(f"Q-Q: F{f_idx} Ch{c_idx}", fontsize=9)
-                ax.grid(True, alpha=0.3)
-
-        qq_fig.suptitle(
-            f"{title_prefix} — Q-Q Plots (step {self.global_step})",
-            fontsize=13, fontweight="bold",
-        )
-        qq_fig.tight_layout(rect=[0, 0, 1, 0.96])
-
-        return hist_fig, qq_fig
-
-    def _log_gaussian_plots_to_wandb(
-        self,
-        data: torch.Tensor,
-        namespace: str,
-    ) -> None:
-        """Create Gaussian-check plots from *data* and log them to W&B."""
-        import wandb as _wandb
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        try:
-            hist_fig, qq_fig = self._create_gaussian_check_figures(
-                data, title_prefix=namespace.capitalize(),
-            )
-            self.logger.experiment.log(
-                {
-                    f"embedding_gaussian/{namespace}_histograms": _wandb.Image(hist_fig),
-                    f"embedding_gaussian/{namespace}_qqplots": _wandb.Image(qq_fig),
-                },
-            )
-            plt.close(hist_fig)
-            plt.close(qq_fig)
-            rank_zero_print(
-                cyan(f"Logged {namespace} Gaussian-check plots to W&B (step {self.global_step})")
-            )
-        except Exception as e:
-            rank_zero_print(f"WARNING: Failed to log Gaussian plots: {e}")
 
     # ---------------------------------------------------------------------
     # Data Preprocessing Utils
